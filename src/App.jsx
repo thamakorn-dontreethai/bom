@@ -1,82 +1,118 @@
-import { useState, useEffect } from 'react'
-import BomHeader from './components/BomHeader'
-import BomTree from './components/BomTree'
+import { useState, useRef } from 'react'
+import BomDocumentView from './components/BomDocumentView'
 import './App.css'
 
-function App() {
-  const [bomList, setBomList] = useState([])
-  const [activeBom, setActiveBom] = useState(null)
+export default function App() {
+  const [bom, setBom] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
+  const fileRef = useRef(null)
 
-  useEffect(() => {
-    fetchBomList()
-  }, [])
-
-  async function fetchBomList() {
-    try {
-      const res = await fetch('/api/bom')
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      const data = await res.json()
-      setBomList(data)
-      if (data.length > 0) loadBom(data[0].id)
-    } catch (e) {
-      setError('Cannot connect to API — is the backend running on port 3001?')
+  async function handleFile(file) {
+    if (!file) return
+    if (!file.name.toLowerCase().endsWith('.pdf')) {
+      setError('กรุณาเลือกไฟล์ PDF เท่านั้น')
+      return
     }
-  }
-
-  async function loadBom(id) {
     setLoading(true)
     setError(null)
     try {
-      const res = await fetch(`/api/bom/${id}`)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      setActiveBom(await res.json())
+      // Step 1: upload PDF → get design_spec_id
+      const fd = new FormData()
+      fd.append('file', file)
+      const impRes = await fetch('/api/import/pdf', { method: 'POST', body: fd })
+      const impData = await impRes.json()
+      if (!impRes.ok) throw new Error(impData.error)
+
+      // Step 2: load full BOM from DB
+      const bomRes = await fetch(`/api/bom/${impData.design_spec_id}`)
+      const bomData = await bomRes.json()
+      if (!bomRes.ok) throw new Error(bomData.error)
+
+      setBom(bomData)
     } catch (e) {
-      setError('Failed to load BOM: ' + e.message)
+      setError(e.message)
     } finally {
       setLoading(false)
     }
   }
 
+  function onFileChange(e) { handleFile(e.target.files[0]) }
+  function onDrop(e) {
+    e.preventDefault()
+    handleFile(e.dataTransfer.files[0])
+  }
+  function onDragOver(e) { e.preventDefault() }
+
+  /* ── BOM view ── */
+  if (bom) {
+    return (
+      <div className="app">
+        <header className="app-bar">
+          <span className="app-bar__title">BOM Management System</span>
+          <span className="app-bar__sub">TOYODA GOSEI CO., LTD.</span>
+          <div className="app-bar__spacer" />
+          <button className="app-bar__btn" onClick={() => { setBom(null); setError(null) }}>
+            ← Import ใหม่
+          </button>
+        </header>
+        <main className="main-full">
+          <BomDocumentView bom={bom} />
+        </main>
+      </div>
+    )
+  }
+
+  /* ── Upload screen ── */
   return (
-    <div className="app">
-      <header className="app-bar">
-        <span className="app-bar__title">BOM Management System</span>
-        <span className="app-bar__sub">TOYODA GOSEI CO., LTD.</span>
-      </header>
+    <div className="app-upload">
+      <div className="upload-card">
+        <div className="upload-header">
+          <div className="upload-logo-mark">BOM</div>
+          <div>
+            <div className="upload-title">BOM Management System</div>
+            <div className="upload-company">TOYODA GOSEI CO., LTD.</div>
+          </div>
+        </div>
 
-      <div className="app-body">
-        <aside className="sidebar">
-          <div className="sidebar__heading">Documents</div>
-          <ul className="sidebar__list">
-            {bomList.map(b => (
-              <li
-                key={b.id}
-                className={`sidebar__item${activeBom?.id === b.id ? ' sidebar__item--active' : ''}`}
-                onClick={() => loadBom(b.id)}
-              >
-                <span className="sidebar__model">{b.model}</span>
-                <span className="sidebar__partno">{b.customer_part_no}</span>
-                <span className="sidebar__name">{b.part_name}</span>
-              </li>
-            ))}
-          </ul>
-        </aside>
-
-        <main className="main">
-          {error && <div className="alert alert--error">{error}</div>}
-          {loading && <div className="loading">Loading…</div>}
-          {activeBom && !loading && (
+        <div
+          className={`upload-dropzone${loading ? ' upload-dropzone--loading' : ''}`}
+          onDrop={onDrop}
+          onDragOver={onDragOver}
+          onClick={() => !loading && fileRef.current?.click()}
+        >
+          <input
+            ref={fileRef}
+            type="file"
+            accept=".pdf"
+            style={{ display: 'none' }}
+            onChange={onFileChange}
+          />
+          {loading ? (
             <>
-              <BomHeader bom={activeBom} />
-              <BomTree bom={activeBom} onRefresh={() => loadBom(activeBom.id)} />
+              <div className="upload-spinner" />
+              <div className="upload-drop-text">กำลัง parse PDF…</div>
+            </>
+          ) : (
+            <>
+              <div className="upload-icon">📄</div>
+              <div className="upload-drop-main">คลิกเพื่อเลือกไฟล์ PDF</div>
+              <div className="upload-drop-sub">หรือลาก & วางไฟล์ที่นี่</div>
+              <div className="upload-drop-hint">รองรับไฟล์ Design Specification Instruction (1542)</div>
             </>
           )}
-        </main>
+        </div>
+
+        {error && <div className="upload-error">⚠ {error}</div>}
+
+        <div className="upload-steps">
+          <div className="upload-step"><span className="step-no">1</span>Import ไฟล์ PDF</div>
+          <div className="upload-arrow">→</div>
+          <div className="upload-step"><span className="step-no">2</span>ระบบสร้างตาราง BOM</div>
+          <div className="upload-arrow">→</div>
+          <div className="upload-step"><span className="step-no">3</span>Download เป็น PDF</div>
+        </div>
       </div>
     </div>
   )
 }
-
-export default App
