@@ -5,26 +5,26 @@ const router = express.Router()
 
 const HEADER_SELECT = `
   SELECT
-    ds.design_spec_id                        AS id,
-    m.model_code                             AS model,
+    ds.design_spec_id                             AS id,
+    m.model_code                                  AS model,
     m.model_name,
     ds.customer_part_no,
     ds.production_level,
-    ds.initial_stage                         AS control_rank,
+    ds.initial_stage                              AS control_rank,
     ds.reg_certif,
-    to_char(ds.effective_date, 'DD-Mon-YY')  AS date,
-    c.customer_code                          AS customer,
+    to_char(ds.effective_date, 'DD-Mon-YY')       AS date,
+    c.customer_code                               AS customer,
     c.customer_name,
     ds.tg_part_no,
-    ds.customer_standard                     AS customer_standards,
-    ds.tg_standard                           AS tg_standards,
+    ds.customer_standard                          AS customer_standards,
+    ds.tg_standard                                AS tg_standards,
     ds.internal_eci_no,
-    COALESCE(bd.type, 'HE')                  AS type,
+    COALESCE(bd.type, 'HE')                       AS type,
     ds.prepared_by,
     ds.checked_by,
     ds.approved_by,
     ds.confirmed_by,
-    'WHEEL ASSY, STEERING (N)'               AS part_name
+    'WHEEL ASSY, STEERING (N)'                    AS part_name
   FROM tg.design_spec ds
   JOIN tg.model    m ON m.model_id    = ds.model_id
   JOIN tg.customer c ON c.customer_id = ds.customer_id
@@ -85,6 +85,44 @@ const ITEMS_SQL = `
   ORDER BY it.sort_order NULLS LAST, it.bom_id
 `
 
+// PATCH /api/bom/:id/header  — save editable header fields
+router.patch('/:id/header', async (req, res) => {
+  const b   = req.body
+  const dsId = parseInt(req.params.id)
+  try {
+    // prepared_by / approved_by always exist
+    await pool.query(
+      `UPDATE tg.design_spec
+       SET prepared_by = $1, approved_by = $2
+       WHERE design_spec_id = $3`,
+      [b.revisioner ?? null, b.approved_by ?? null, dsId]
+    )
+    // evt_* and concern_* columns added by migration_001 — skip if not yet migrated
+    try {
+      await pool.query(
+        `UPDATE tg.design_spec
+         SET evt_first_issue   = $1,
+             evt_cv            = $2,
+             evt_mq            = $3,
+             evt_dan           = $4,
+             evt_hin           = $5,
+             evt_sop           = $6,
+             concern_drawing      = $7,
+             concern_actual_part  = $8
+         WHERE design_spec_id = $9`,
+        [!!b.evt_first_issue, !!b.evt_cv, !!b.evt_mq,
+         !!b.evt_dan, !!b.evt_hin, !!b.evt_sop,
+         !!b.concern_drawing, !!b.concern_actual_part,
+         dsId]
+      )
+    } catch (_) { /* migration_001 not yet applied — silently skip */ }
+
+    res.json({ saved: true })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
 // GET /api/bom
 router.get('/', async (_req, res) => {
   try {
@@ -104,9 +142,172 @@ router.get('/:id', async (req, res) => {
     if (!h.length) return res.status(404).json({ error: 'BOM not found' })
 
     const { rows: items } = await pool.query(ITEMS_SQL, [req.params.id])
-    res.json({ ...h[0], items })
+
+    // bom_revision rows (migration_001+)
+    let revisions = []
+    try {
+      const { rows } = await pool.query(
+        `SELECT mark, revision_record, eci_no,
+                to_char(revision_date, 'DD-Mon-YY') AS revision_date,
+                revisioner, approved_by
+         FROM tg.bom_revision
+         WHERE design_spec_id = $1
+         ORDER BY sort_order, revision_id`,
+        [req.params.id]
+      )
+      revisions = rows
+    } catch (_) {}
+
+    // Per-item update history (migration_002 — skip if not yet applied)
+    let itemHistory = {}
+    let itemUpdateLevels = {}
+    try {
+      const [histRes, levRes] = await Promise.all([
+        pool.query(
+          `SELECT bih.bom_id, bih.introduced_at, bih.superseded_at, bih.old_tg_part_no
+           FROM tg.bom_item_history bih
+           JOIN tg.bom b ON b.bom_id = bih.bom_id
+           WHERE b.design_spec_id = $1
+           ORDER BY bih.bom_id, bih.superseded_at`,
+          [req.params.id]
+        ),
+        pool.query(
+          'SELECT bom_id, update_level FROM tg.bom WHERE design_spec_id = $1',
+          [req.params.id]
+        ),
+      ])
+      histRes.rows.forEach(r => {
+        if (!itemHistory[r.bom_id]) itemHistory[r.bom_id] = []
+        itemHistory[r.bom_id].push(r)
+      })
+      levRes.rows.forEach(r => { itemUpdateLevels[r.bom_id] = r.update_level })
+    } catch (_) {}
+
+    // TGT Part No. history (migration_002)
+    let tgtHistory = []
+    let tgtUpdateLevel = 0
+    try {
+      const [tgtHRes, tgtLRes] = await Promise.all([
+        pool.query(
+          `SELECT introduced_at, superseded_at, old_tg_part_no
+           FROM tg.design_spec_tgt_history
+           WHERE design_spec_id = $1
+           ORDER BY superseded_at`,
+          [req.params.id]
+        ),
+        pool.query(
+          'SELECT tgt_update_level FROM tg.design_spec WHERE design_spec_id = $1',
+          [req.params.id]
+        ),
+      ])
+      tgtHistory = tgtHRes.rows
+      tgtUpdateLevel = tgtLRes.rows[0]?.tgt_update_level ?? 0
+    } catch (_) {}
+
+    const enrichedItems = items.map(item => ({
+      ...item,
+      update_level: itemUpdateLevels[item.id] ?? 0,
+      history: itemHistory[item.id] ?? [],
+    }))
+
+    res.json({
+      ...h[0],
+      tgt_history: tgtHistory,
+      tgt_update_level: tgtUpdateLevel,
+      revisions,
+      items: enrichedItems,
+    })
   } catch (e) {
     res.status(500).json({ error: e.message })
+  }
+})
+
+// POST /api/bom/:id/revision
+// Record a BOM update: save old part nos to history, update to new, add bom_revision row
+router.post('/:id/revision', async (req, res) => {
+  const dsId = parseInt(req.params.id)
+  const { eci_no, revision_date, revisioner, approved_by, items = [], new_tg_part_no } = req.body
+
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+
+    // Determine next update level from existing bom_revision marks
+    const { rows: lvRows } = await client.query(
+      `SELECT COALESCE(
+         MAX(CASE WHEN mark ~ '^[0-9]+$' THEN mark::smallint ELSE 0 END), 0
+       ) AS max_level
+       FROM tg.bom_revision WHERE design_spec_id = $1`,
+      [dsId]
+    )
+    const newLevel = (lvRows[0].max_level ?? 0) + 1
+
+    // Process each changed item
+    for (const { bom_id, new_part_no } of items) {
+      if (!new_part_no?.trim()) continue
+      const { rows: cur } = await client.query(
+        `SELECT b.update_level, p.tg_part_no, p.customer_part_no, p.part_id
+         FROM tg.bom b JOIN tg.part p ON p.part_id = b.child_part_id
+         WHERE b.bom_id = $1 AND b.design_spec_id = $2`,
+        [bom_id, dsId]
+      )
+      if (!cur.length) continue
+      const c = cur[0]
+      await client.query(
+        `INSERT INTO tg.bom_item_history
+           (bom_id, introduced_at, superseded_at, old_tg_part_no, old_customer_part_no)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [bom_id, c.update_level, newLevel, c.tg_part_no, c.customer_part_no]
+      )
+      await client.query(
+        'UPDATE tg.bom SET update_level = $1 WHERE bom_id = $2',
+        [newLevel, bom_id]
+      )
+      await client.query(
+        'UPDATE tg.part SET tg_part_no = $1, updated_at = NOW() WHERE part_id = $2',
+        [new_part_no.trim(), c.part_id]
+      )
+    }
+
+    // Handle TGT Part No. change
+    if (new_tg_part_no?.trim()) {
+      const { rows: dsRows } = await client.query(
+        'SELECT tg_part_no, tgt_update_level FROM tg.design_spec WHERE design_spec_id = $1',
+        [dsId]
+      )
+      if (dsRows.length && dsRows[0].tg_part_no !== new_tg_part_no.trim()) {
+        await client.query(
+          `INSERT INTO tg.design_spec_tgt_history
+             (design_spec_id, introduced_at, superseded_at, old_tg_part_no)
+           VALUES ($1, $2, $3, $4)`,
+          [dsId, dsRows[0].tgt_update_level ?? 0, newLevel, dsRows[0].tg_part_no]
+        )
+        await client.query(
+          'UPDATE tg.design_spec SET tg_part_no = $1, tgt_update_level = $2 WHERE design_spec_id = $3',
+          [new_tg_part_no.trim(), newLevel, dsId]
+        )
+      }
+    }
+
+    // Add bom_revision entry
+    await client.query(
+      `INSERT INTO tg.bom_revision
+         (design_spec_id, sort_order, mark, revision_record, eci_no, revision_date, revisioner, approved_by)
+       VALUES ($1, $2, $3, 'Update ECI No.', $4, $5, $6, $7)`,
+      [dsId, newLevel, String(newLevel),
+       eci_no ?? null,
+       revision_date ? new Date(revision_date) : null,
+       revisioner ?? null,
+       approved_by ?? null]
+    )
+
+    await client.query('COMMIT')
+    res.json({ update_level: newLevel })
+  } catch (e) {
+    await client.query('ROLLBACK')
+    res.status(500).json({ error: e.message })
+  } finally {
+    client.release()
   }
 })
 

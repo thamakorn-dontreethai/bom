@@ -17,14 +17,13 @@ export default function App() {
     setLoading(true)
     setError(null)
     try {
-      // Step 1: upload PDF → get design_spec_id
       const fd = new FormData()
       fd.append('file', file)
+
       const impRes = await fetch('/api/import/pdf', { method: 'POST', body: fd })
       const impData = await impRes.json()
       if (!impRes.ok) throw new Error(impData.error)
 
-      // Step 2: load full BOM from DB
       const bomRes = await fetch(`/api/bom/${impData.design_spec_id}`)
       const bomData = await bomRes.json()
       if (!bomRes.ok) throw new Error(bomData.error)
@@ -38,13 +37,18 @@ export default function App() {
   }
 
   function onFileChange(e) { handleFile(e.target.files[0]) }
-  function onDrop(e) {
-    e.preventDefault()
-    handleFile(e.dataTransfer.files[0])
-  }
+  function onDrop(e) { e.preventDefault(); handleFile(e.dataTransfer.files[0]) }
   function onDragOver(e) { e.preventDefault() }
 
-  /* ── BOM view ── */
+  async function refreshBom() {
+    if (!bom) return
+    try {
+      const r = await fetch(`/api/bom/${bom.id}`)
+      const d = await r.json()
+      if (r.ok) setBom(d)
+    } catch (_) {}
+  }
+
   if (bom) {
     return (
       <div className="app">
@@ -57,13 +61,12 @@ export default function App() {
           </button>
         </header>
         <main className="main-full">
-          <BomDocumentView bom={bom} />
+          <BomDocumentView bom={bom} onRefresh={refreshBom} />
         </main>
       </div>
     )
   }
 
-  /* ── Upload screen ── */
   return (
     <div className="app-upload">
       <div className="upload-card">

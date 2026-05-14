@@ -1,12 +1,13 @@
 import { useState, useRef } from 'react'
 
 function PdfImport({ onClose, onRefresh }) {
-  const [step, setStep] = useState('idle')   // idle | parsing | result | error
+  const [step, setStep] = useState('idle')   // idle | parsing | manual_eci | result | error
   const [result, setResult] = useState(null)
   const [errMsg, setErrMsg] = useState('')
+  const [manualEci, setManualEci] = useState('')
   const fileRef = useRef(null)
 
-  async function handleUpload() {
+  async function handleUpload(customEci = null) {
     const file = fileRef.current?.files?.[0]
     if (!file) return
     setStep('parsing')
@@ -14,9 +15,19 @@ function PdfImport({ onClose, onRefresh }) {
     try {
       const fd = new FormData()
       fd.append('file', file)
+      if (customEci) fd.append('eci_no', customEci)
       const res = await fetch('/api/import/pdf', { method: 'POST', body: fd })
       const data = await res.json()
-      if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`)
+
+      if (!res.ok) {
+        if (data.code === 'ECI_NOT_FOUND') {
+          setStep('manual_eci')
+          setErrMsg(data.error)
+          return
+        }
+        throw new Error(data.error ?? `HTTP ${res.status}`)
+      }
+      
       setResult(data)
       setStep('result')
     } catch (e) {
@@ -41,11 +52,39 @@ function PdfImport({ onClose, onRefresh }) {
               </p>
               <div className="modal__file-row">
                 <input ref={fileRef} type="file" accept=".pdf" className="modal__file-input" />
-                <button className="btn-primary" onClick={handleUpload}>Parse PDF</button>
+                <button className="btn-primary" onClick={() => handleUpload()}>Parse PDF</button>
               </div>
               {step === 'error' && (
                 <div className="modal__error">{errMsg}</div>
               )}
+            </>
+          )}
+
+          {step === 'manual_eci' && (
+            <>
+              <div className="modal__error" style={{ marginBottom: '16px' }}>
+                ⚠ {errMsg}
+              </div>
+              <p className="modal__hint">
+                Please enter the ECI Number manually (e.g. 26A376):
+              </p>
+              <div className="modal__file-row">
+                <input 
+                  type="text" 
+                  className="modal__input" 
+                  value={manualEci} 
+                  onChange={e => setManualEci(e.target.value.toUpperCase())}
+                  placeholder="ECI Number"
+                />
+                <button 
+                  className="btn-primary" 
+                  disabled={!manualEci.trim()}
+                  onClick={() => handleUpload(manualEci.trim())}
+                >
+                  Submit
+                </button>
+                <button className="btn-secondary" onClick={() => setStep('idle')}>Cancel</button>
+              </div>
             </>
           )}
 

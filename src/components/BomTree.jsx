@@ -25,8 +25,24 @@ function flattenVisible(nodes, collapsed, depth = 0) {
   return rows
 }
 
+function groupByKey(items) {
+  const buckets = {}
+  items.forEach(it => {
+    const k = it.key_code ?? '1'
+    if (!buckets[k]) buckets[k] = []
+    buckets[k].push(it)
+  })
+  return Object.entries(buckets)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, rows]) => ({ key, rows }))
+}
+
+const KEY_LABELS = {
+  '1': 'Key 1 — NH-900L (Black)',
+  '2': 'Key 2 — NH-1168L (Light Soft Gray)',
+}
+
 const COLS = [
-  { key: 'key_code',           label: 'Key',                width: 38 },
   { key: 'level',              label: 'Lv',                 width: 30 },
   { key: 'level_code',         label: 'PP-Mold',            width: 60 },
   { key: 'rc',                 label: 'R/C',                width: 36 },
@@ -45,7 +61,6 @@ const COLS = [
   { key: 'material_type',      label: 'Mat. Type',          width: 80 },
   { key: 'color_no',           label: 'Color No.',          width: 90 },
   { key: 'color_tone',         label: 'Color Tone',         width: 120 },
-  { key: 'material_mass',      label: 'Mat. Mass',          width: 70 },
   { key: 'sa',                 label: 'SA',                 width: 80 },
   { key: 'note',               label: 'Note',               width: 300 },
 ]
@@ -57,10 +72,7 @@ function Cell({ col, row, onToggle, collapsed }) {
     const hasChildren = row.children.length > 0
     return (
       <td className="part-name-cell" style={{ minWidth: col.width }}>
-        <span
-          className="part-name-indent"
-          style={{ paddingLeft: row.depth * 16 }}
-        >
+        <span className="part-name-indent" style={{ paddingLeft: row.depth * 16 }}>
           {hasChildren ? (
             <button className="toggle-btn" onClick={() => onToggle(row.id)}>
               {collapsed.has(row.id) ? '▶' : '▼'}
@@ -88,8 +100,7 @@ function Cell({ col, row, onToggle, collapsed }) {
 function BomTree({ bom }) {
   const [collapsed, setCollapsed] = useState(new Set())
 
-  const tree = buildTree(bom.items ?? [])
-  const rows = flattenVisible(tree, collapsed)
+  const groups = groupByKey(bom.items ?? [])
 
   function toggle(id) {
     setCollapsed(prev => {
@@ -112,25 +123,36 @@ function BomTree({ bom }) {
             </tr>
           </thead>
           <tbody>
-            {rows.map(row => (
-              <tr
-                key={row.id}
-                className={[
-                  row.level === 1 ? 'row--lv1' : '',
-                  row.key_code === '2' ? 'row--key2' : 'row--key1',
-                ].filter(Boolean).join(' ')}
-              >
-                {COLS.map(col => (
-                  <Cell
-                    key={col.key}
-                    col={col}
-                    row={row}
-                    onToggle={toggle}
-                    collapsed={collapsed}
-                  />
-                ))}
-              </tr>
-            ))}
+            {groups.map(g => {
+              const rows = flattenVisible(buildTree(g.rows), collapsed)
+              const label = KEY_LABELS[g.key] ?? `Key ${g.key}`
+              return (
+                <>
+                  <tr key={`key-hdr-${g.key}`} className="row--key-header">
+                    <td colSpan={COLS.length}>{label}</td>
+                  </tr>
+                  {rows.map(row => (
+                    <tr
+                      key={row.id}
+                      className={[
+                        row.level === 1 ? 'row--lv1' : '',
+                        row.key_code === '2' ? 'row--key2' : 'row--key1',
+                      ].filter(Boolean).join(' ')}
+                    >
+                      {COLS.map(col => (
+                        <Cell
+                          key={col.key}
+                          col={col}
+                          row={row}
+                          onToggle={toggle}
+                          collapsed={collapsed}
+                        />
+                      ))}
+                    </tr>
+                  ))}
+                </>
+              )
+            })}
           </tbody>
         </table>
       </div>
