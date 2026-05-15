@@ -244,6 +244,54 @@ body {
   font-size: 13px;
 }
 
+.upload-manual {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.upload-manual__label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #444;
+}
+
+.upload-manual__row {
+  display: flex;
+  gap: 8px;
+}
+
+.upload-manual__input {
+  flex: 1;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 13px;
+  font-family: monospace;
+  outline: none;
+}
+
+.upload-manual__input:focus {
+  border-color: #1a56db;
+  box-shadow: 0 0 0 2px #1a56db22;
+}
+
+.upload-manual__btn {
+  background: #1a56db;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 18px;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.upload-manual__btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .upload-steps {
   display: flex;
   align-items: center;
@@ -590,9 +638,9 @@ body {
 /* ── white paper ── */
 .bdv-paper {
   background: #fff;
-  width: 1450px;
-  min-width: 1450px;
-  max-width: 1450px;
+  width: 1600px;
+  min-width: 1600px;
+  max-width: 1600px;
   margin: 0 auto 24px;
   box-shadow: 0 2px 18px rgba(0, 0, 0, .35);
 }
@@ -772,7 +820,8 @@ body {
 
 /* data rows — no color by default; colors only appear on revised/edited rows */
 .bp-row td {
-  height: 13px;
+  min-height: 13px;
+  height: auto;
   text-align: left;
   color: #000;
 }
@@ -814,13 +863,16 @@ body {
   padding-left: 4px;
 }
 
-.bp-td-name {
+.bp-td-name,
+.bp-bom-tbl td.bp-td-name {
   text-align: left;
   white-space: normal;
   word-break: break-word;
+  overflow: visible;
 }
 
-.bp-td-spec {
+.bp-td-spec,
+.bp-bom-tbl td.bp-td-spec {
   text-align: left;
   font-size: 7px;
   color: inherit;

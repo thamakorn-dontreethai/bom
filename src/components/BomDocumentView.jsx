@@ -21,24 +21,56 @@ function flatten(nodes) {
 const MIN_ROWS = 40
 
 const KEY_LABELS = {
-  '1': 'Key 1 — NH-900L (Black)',
-  '2': 'Key 2 — NH-1168L (Light Soft Gray)',
+  '1': 'Key 1 — NH-900L (N)',
+  '2': 'Key 2 — NH-1168L (C)',
+  '3': 'Key 3 — NH-900L (L)',
+  '4': 'Key 4 — NH-1168L (R)',
+  '5': 'Key 5 — NH-802L (N)',
+  '6': 'Key 6 — NH-802L (C)',
 }
 
 function groupByKey(items) {
-  const buckets = {}
+  const keyed = {}   // key_code → items belonging to that key
+  const shared = []  // key_code = null → sub-parts without explicit key
+
   items.forEach(it => {
-    const k = it.key_code ?? '1'
-    if (!buckets[k]) buckets[k] = []
-    buckets[k].push(it)
+    if (it.key_code == null) {
+      shared.push(it)
+    } else {
+      const k = String(it.key_code)
+      if (!keyed[k]) keyed[k] = []
+      keyed[k].push(it)
+    }
   })
-  return Object.entries(buckets)
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([key, rows]) => ({
-      key,
-      label: KEY_LABELS[key] ?? `Key ${key}`,
-      rows: flatten(buildTree(rows)),
-    }))
+
+  const keys = Object.keys(keyed).sort((a, b) => Number(a) - Number(b))
+
+  if (!keys.length) {
+    return [{ key: '0', label: '', rows: flatten(buildTree([...shared])) }]
+  }
+
+  return keys.map(k => {
+    // BFS: seed = this key's own items; iteratively pull in shared items
+    // whose parent is already in the seed — prevents other keys' sub-parts
+    // from leaking onto this page as orphan roots.
+    const seed = new Set(keyed[k].map(it => it.id))
+    let changed = true
+    while (changed) {
+      changed = false
+      for (const it of shared) {
+        if (!seed.has(it.id) && it.parent_id != null && seed.has(it.parent_id)) {
+          seed.add(it.id)
+          changed = true
+        }
+      }
+    }
+    const pageItems = [...keyed[k], ...shared.filter(it => seed.has(it.id))]
+    return {
+      key: k,
+      label: KEY_LABELS[k] ?? `Key ${k}`,
+      rows: flatten(buildTree(pageItems)),
+    }
+  })
 }
 
 export default function BomDocumentView({ bom, onRefresh }) {
@@ -202,18 +234,18 @@ function BomPage({ bom, header, onToggle, onField, rows, pageNum, totalPages }) 
   return (
     <div className="bp">
 
-      {/* ═══ Document header ═══════════════════════════════ */}
+      {/* Document header */}
       <table className="bp-hdr-tbl">
         <colgroup>
-          {[58,58,58,58,58].map((w,i) => <col key={`pn${i}`} style={{ width: w }} />)}
+          {[85, 85, 85, 85, 85].map((w, i) => <col key={`pn${i}`} style={{ width: w }} />)}
           <col style={{ width: 160 }} />
           <col style={{ width: 260 }} />
           <col style={{ width: 30 }} />
           <col style={{ width: 26 }} />
           <col style={{ width: 26 }} />
           <col style={{ width: 54 }} />
-          {[26,26,26,26,26].map((w,i) => <col key={`mc${i}`} style={{ width: w }} />)}
-          {[24,24,24,24].map((w,i) => <col key={`sp${i}`} style={{ width: w }} />)}
+          {[26, 26, 26, 26, 26].map((w, i) => <col key={`mc${i}`} style={{ width: w }} />)}
+          {[24, 24, 24, 24].map((w, i) => <col key={`sp${i}`} style={{ width: w }} />)}
           <col style={{ width: 26 }} />
           <col style={{ width: 30 }} />
           <col style={{ width: 30 }} />
@@ -326,14 +358,14 @@ function BomPage({ bom, header, onToggle, onField, rows, pageNum, totalPages }) 
       {/* ═══ Main BOM table ════════════════════════════════ */}
       <table className="bp-bom-tbl">
         <colgroup>
-          {[58,58,58,58,58].map((w,i) => <col key={i} style={{ width: w }} />)}
+          {[85, 85, 85, 85, 85].map((w, i) => <col key={i} style={{ width: w }} />)}
           <col style={{ width: 160 }} />
           <col style={{ width: 260 }} />
           <col style={{ width: 30 }} />
           <col style={{ width: 26 }} />
           <col style={{ width: 26 }} /><col style={{ width: 54 }} />
-          {[26,26,26,26,26].map((w,i) => <col key={i} style={{ width: w }} />)}
-          {[24,24,24,24].map((w,i) => <col key={i} style={{ width: w }} />)}
+          {[26, 26, 26, 26, 26].map((w, i) => <col key={i} style={{ width: w }} />)}
+          {[24, 24, 24, 24].map((w, i) => <col key={i} style={{ width: w }} />)}
           <col style={{ width: 26 }} />
           <col style={{ width: 30 }} />
           <col style={{ width: 30 }} />
@@ -357,11 +389,11 @@ function BomPage({ bom, header, onToggle, onField, rows, pageNum, totalPages }) 
             <th rowSpan={2} className="bp-th bp-th-remark">Remark</th>
           </tr>
           <tr>
-            {[1,2,3,4,5].map(n => <th key={n} className="bp-th bp-th-pn">{n}</th>)}
+            {[1, 2, 3, 4, 5].map(n => <th key={n} className="bp-th bp-th-pn">{n}</th>)}
             <th className="bp-th bp-th-xs">Part</th>
             <th className="bp-th bp-th-xs">Gate</th>
-            {[1,2,3,4,5].map(n => <th key={n} className="bp-th bp-th-xs">{n}</th>)}
-            {['M/C','T/T','Local','Import'].map(s => <th key={s} className="bp-th bp-th-xs">{s}</th>)}
+            {[1, 2, 3, 4, 5].map(n => <th key={n} className="bp-th bp-th-xs">{n}</th>)}
+            {['M/C', 'T/T', 'Local', 'Import'].map(s => <th key={s} className="bp-th bp-th-xs">{s}</th>)}
           </tr>
         </thead>
         <tbody>
@@ -528,8 +560,8 @@ function BomRow({ row }) {
       <td className="bp-td bp-td-c">{row.quantity != null ? Math.round(row.quantity) : ''}</td>
       <td className="bp-td bp-td-c">{row.mass_g != null ? Number(row.mass_g).toLocaleString() : ''}</td>
       <td className="bp-td bp-td-c" /><td className="bp-td bp-td-c" />
-      {[0,1,2,3,4].map(i => <td key={i} className="bp-td bp-td-c" />)}
-      {[0,1,2,3].map(i => <td key={i} className="bp-td bp-td-c" />)}
+      {[0, 1, 2, 3, 4].map(i => <td key={i} className="bp-td bp-td-c" />)}
+      {[0, 1, 2, 3].map(i => <td key={i} className="bp-td bp-td-c" />)}
       <td className="bp-td bp-td-c" />
       <td className="bp-td bp-td-c" />
       <td className="bp-td bp-td-c" />

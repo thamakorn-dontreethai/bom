@@ -94,7 +94,7 @@ export default function App() {
           {loading ? (
             <>
               <div className="upload-spinner" />
-              <div className="upload-drop-text">กำลัง parse PDF…</div>
+              <div className="upload-drop-text">กำลังวิเคราะห์ด้วย AI… (อาจใช้เวลา 30–60 วินาที)</div>
             </>
           ) : (
             <>
@@ -111,7 +111,7 @@ export default function App() {
         <div className="upload-steps">
           <div className="upload-step"><span className="step-no">1</span>Import ไฟล์ PDF</div>
           <div className="upload-arrow">→</div>
-          <div className="upload-step"><span className="step-no">2</span>ระบบสร้างตาราง BOM</div>
+          <div className="upload-step"><span className="step-no">2</span>AI วิเคราะห์ข้อมูล</div>
           <div className="upload-arrow">→</div>
           <div className="upload-step"><span className="step-no">3</span>Download เป็น PDF</div>
         </div>
