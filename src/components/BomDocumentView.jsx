@@ -2,13 +2,52 @@ import { useRef, useState } from 'react'
 import jsPDF from 'jspdf'
 import html2canvas from 'html2canvas'
 
+// Follow the sort_order chain from a revised_out through any intermediate revised_out rows
+// to the final active replacement. Handles A(revised)→B(revised)→C(active) chains.
+function findActiveReplacement(revisedOut, items) {
+  let current = revisedOut
+  while (current && current.status === 'revised_out') {
+    current = items.find(r =>
+      r.sort_order === current.sort_order + 1 &&
+      r.parent_id === current.parent_id
+    ) ?? null
+  }
+  return current
+}
+
 function buildTree(items) {
   const map = {}
   items.forEach(i => { map[i.id] = { ...i, children: [] } })
+
+  // For each revised_out, find its final active replacement (following chains)
+  const finalRepOf = {}
+  items.forEach(it => {
+    if (it.status === 'revised_out' && it.sort_order != null) {
+      const rep = findActiveReplacement(it, items)
+      if (rep) finalRepOf[it.id] = rep
+    }
+  })
+
+  const rootItem = items.find(i => (i.level ?? i.bom_level) === 1 && i.status !== 'revised_out')
   const roots = []
+
   items.forEach(i => {
-    if (i.parent_id && map[i.parent_id]) map[i.parent_id].children.push(map[i.id])
-    else roots.push(map[i.id])
+    if (i.status === 'revised_out') return  // placed by insertRevisedOut after flatten
+
+    // If parent is revised_out, re-parent to its final active replacement
+    let parentId = i.parent_id
+    if (parentId && map[parentId] && map[parentId].status === 'revised_out') {
+      const rep = finalRepOf[parentId]
+      parentId = rep ? rep.id : null
+    }
+
+    if (parentId && map[parentId]) {
+      map[parentId].children.push(map[i.id])
+    } else if (rootItem && map[rootItem.id] && i.id !== rootItem.id) {
+      map[rootItem.id].children.push(map[i.id])
+    } else {
+      roots.push(map[i.id])
+    }
   })
   return roots
 }
@@ -16,6 +55,61 @@ function flatten(nodes) {
   const out = []
   for (const n of nodes) { out.push(n); if (n.children.length) out.push(...flatten(n.children)) }
   return out
+}
+
+// Place each revised_out chain immediately before the final active replacement.
+// Example: A(revised)→B(revised)→C(active) inserts [A, B] right before C.
+function insertRevisedOut(flatRows, allItems) {
+  function followChain(start) {
+    const chain = []
+    let current = start
+    while (current && current.status === 'revised_out') {
+      chain.push(current)
+      current = allItems.find(r =>
+        r.sort_order === current.sort_order + 1 &&
+        r.parent_id === current.parent_id
+      ) ?? null
+    }
+    return { chain, finalRep: current }
+  }
+
+  const insertBefore = {}
+  const processedIds = new Set()
+
+  allItems.forEach(it => {
+    if (it.status !== 'revised_out' || processedIds.has(it.id) || it.sort_order == null) return
+    // Only start at chain roots (skip items that are already covered by an earlier chain member)
+    const hasPrev = allItems.some(r =>
+      r.status === 'revised_out' &&
+      r.sort_order === it.sort_order - 1 &&
+      r.parent_id === it.parent_id
+    )
+    if (hasPrev) return
+
+    const { chain, finalRep } = followChain(it)
+    chain.forEach(c => processedIds.add(c.id))
+    if (finalRep) {
+      if (!insertBefore[finalRep.id]) insertBefore[finalRep.id] = []
+      insertBefore[finalRep.id].push(...chain)
+    }
+  })
+
+  const result = []
+  const placed = new Set()
+  for (const row of flatRows) {
+    if (row?.id != null && insertBefore[row.id]) {
+      for (const ro of insertBefore[row.id]) {
+        result.push(ro)
+        placed.add(ro.id)
+      }
+    }
+    result.push(row)
+  }
+  // Any revised_out whose replacement wasn't on this page — append at end
+  allItems.forEach(it => {
+    if (it.status === 'revised_out' && !placed.has(it.id)) result.push(it)
+  })
+  return result
 }
 
 const MIN_ROWS = 40
@@ -29,30 +123,56 @@ const KEY_LABELS = {
   '6': 'Key 6 — NH-802L (C)',
 }
 
+// Parse "1" → [1], "1-2" → [1,2], "1-6" → [1,2,3,4,5,6], "1,3" → [1,3]
+function parseKeyList(keyCode) {
+  if (!keyCode) return []
+  const s = String(keyCode).trim()
+  const range = s.match(/^(\d+)-(\d+)$/)
+  if (range) {
+    const start = parseInt(range[1]), end = parseInt(range[2])
+    const result = []
+    for (let k = start; k <= end; k++) result.push(k)
+    return result
+  }
+  if (s.includes(',')) {
+    return s.split(',').map(n => parseInt(n.trim())).filter(n => !isNaN(n))
+  }
+  const n = parseInt(s)
+  return isNaN(n) ? [] : [n]
+}
+
 function groupByKey(items) {
-  const keyed = {}   // key_code → items belonging to that key
-  const shared = []  // key_code = null → sub-parts without explicit key
+  // keyed[k] = items that must appear on key k's page (single or multi-key)
+  const keyed = {}
+  // shared = items with no explicit key (null) — pulled in via BFS from parent
+  const shared = []
+  const allKeys = new Set()
 
   items.forEach(it => {
-    if (it.key_code == null) {
+    const keys = parseKeyList(it.key_code)
+    if (keys.length === 0) {
       shared.push(it)
     } else {
-      const k = String(it.key_code)
-      if (!keyed[k]) keyed[k] = []
-      keyed[k].push(it)
+      // Add to every page this key covers (handles "1-2" → keys 1 and 2)
+      keys.forEach(k => {
+        const ks = String(k)
+        allKeys.add(ks)
+        if (!keyed[ks]) keyed[ks] = []
+        keyed[ks].push(it)
+      })
     }
   })
 
-  const keys = Object.keys(keyed).sort((a, b) => Number(a) - Number(b))
+  const sortedKeys = [...allKeys].sort((a, b) => Number(a) - Number(b))
 
-  if (!keys.length) {
-    return [{ key: '0', label: '', rows: flatten(buildTree([...shared])) }]
+  if (!sortedKeys.length) {
+    const pageItems = [...shared]
+    return [{ key: '0', label: '', rows: insertRevisedOut(flatten(buildTree(pageItems)), pageItems) }]
   }
 
-  return keys.map(k => {
-    // BFS: seed = this key's own items; iteratively pull in shared items
-    // whose parent is already in the seed — prevents other keys' sub-parts
-    // from leaking onto this page as orphan roots.
+  return sortedKeys.map(k => {
+    // BFS: seed starts with this key's own items, then pulls in null-key
+    // sub-parts whose parent is already in the seed.
     const seed = new Set(keyed[k].map(it => it.id))
     let changed = true
     while (changed) {
@@ -68,7 +188,7 @@ function groupByKey(items) {
     return {
       key: k,
       label: KEY_LABELS[k] ?? `Key ${k}`,
-      rows: flatten(buildTree(pageItems)),
+      rows: insertRevisedOut(flatten(buildTree(pageItems)), pageItems),
     }
   })
 }
@@ -186,6 +306,17 @@ export default function BomDocumentView({ bom, onRefresh }) {
         >
           △ บันทึก Update
         </button>
+        <button
+          className="bdv-btn bdv-btn--danger"
+          disabled={busy || saving}
+          onClick={async () => {
+            if (!window.confirm('ลบข้อมูล revision ทั้งหมดและ reset กลับสู่สภาพเริ่มต้น?')) return
+            await fetch(`/api/bom/${bom.id}/revisions/reset`, { method: 'DELETE' })
+            onRefresh?.()
+          }}
+        >
+          ↺ Reset Revision
+        </button>
         <button className="bdv-btn" onClick={download} disabled={busy || saving}>
           {busy ? 'กำลัง Generate…' : '⬇ Download PDF'}
         </button>
@@ -223,38 +354,57 @@ export default function BomDocumentView({ bom, onRefresh }) {
 }
 
 /* ─────────────────────────────────────────────────────────
-   Full page — matches BOM 3GJ HE.pdf layout
+   BomPage — reconstructed to match BOM 3GJ HE.pdf exactly
+
+   25-column grid (shared by header table + BOM table):
+   ┌─ cols 1-5   Part No. levels 1-5        (85 × 5 = 425 px)
+   ├─ col  6     label area                 (160 px)
+   ├─ col  7     wide value / part-name     (260 px)
+   ├─ cols 8-11  qty / weight-P / weight-G / price  (30 26 26 54)
+   ├─ cols 12-16 material cost 1-5          (26 × 5)
+   ├─ cols 17-20 supplier sub M/C T/T Local Import  (24 × 4)
+   └─ cols 21-25 recie / code / kanban / lead / remark (26 30 30 28 36)
 ───────────────────────────────────────────────────────── */
 function BomPage({ bom, header, onToggle, onField, rows, pageNum, totalPages }) {
-  // Revision record rows — use DB data if available, else synthesise first-issue row
   const revisions = bom.revisions?.length > 0
     ? bom.revisions
     : [{ mark: '–', revision_record: 'First issue', eci_no: bom.internal_eci_no, revision_date: bom.date }]
 
+  /* shared colgroup — identical in header table and BOM table */
+  function Cols() {
+    return (
+      <colgroup>
+        {[85,85,85,85,85].map((w,i)=><col key={`pn${i}`} style={{width:w}}/>)}
+        <col style={{width:160}}/><col style={{width:260}}/>
+        <col style={{width:30}}/><col style={{width:26}}/>
+        <col style={{width:26}}/><col style={{width:54}}/>
+        {[26,26,26,26,26].map((w,i)=><col key={`mc${i}`} style={{width:w}}/>)}
+        {[24,24,24,24].map((w,i)=><col key={`sp${i}`} style={{width:w}}/>)}
+        <col style={{width:26}}/><col style={{width:30}}/>
+        <col style={{width:30}}/><col style={{width:28}}/>
+        <col style={{width:36}}/>
+      </colgroup>
+    )
+  }
+
   return (
     <div className="bp">
 
-      {/* Document header */}
+      {/* ══════════════════════════════════════════════════════
+          BLOCK 1 — Document header
+          Row sums (all must equal 25):
+            Row 1: 5 + 9 + 1 + 10 = 25
+            Row 2: 2+1+3 + 19     = 25
+            Row 3: 2+1+3 + 19     = 25
+            Row 4: 2+1+3+9+10     = 25
+         ══════════════════════════════════════════════════════ */}
       <table className="bp-hdr-tbl">
-        <colgroup>
-          {[85, 85, 85, 85, 85].map((w, i) => <col key={`pn${i}`} style={{ width: w }} />)}
-          <col style={{ width: 160 }} />
-          <col style={{ width: 260 }} />
-          <col style={{ width: 30 }} />
-          <col style={{ width: 26 }} />
-          <col style={{ width: 26 }} />
-          <col style={{ width: 54 }} />
-          {[26, 26, 26, 26, 26].map((w, i) => <col key={`mc${i}`} style={{ width: w }} />)}
-          {[24, 24, 24, 24].map((w, i) => <col key={`sp${i}`} style={{ width: w }} />)}
-          <col style={{ width: 26 }} />
-          <col style={{ width: 30 }} />
-          <col style={{ width: 30 }} />
-          <col style={{ width: 28 }} />
-          <col style={{ width: 36 }} />
-        </colgroup>
+        <Cols />
         <tbody>
-          {/* Row 1 — Event Issue | Title | Page | Signature */}
+
+          {/* ── Row 1: [Event Issue | Concern With] [BILL OF MATERIAL] [Page] [Signature] */}
           <tr>
+            {/* LEFT BLOCK — Event Issue + Concern With (cols 1-5) */}
             <td className="bp-event" colSpan={5}>
               <table className="bp-evt-tbl">
                 <thead>
@@ -265,221 +415,254 @@ function BomPage({ bom, header, onToggle, onField, rows, pageNum, totalPages }) 
                 </thead>
                 <tbody>
                   <tr>
-                    <td><Chk checked={header.evt_first_issue} onChange={() => onToggle('evt_first_issue')} />First issue</td>
-                    <td><Chk checked={header.evt_dan} onChange={() => onToggle('evt_dan')} />DAN</td>
-                    <td><Chk checked={header.concern_drawing} onChange={() => onToggle('concern_drawing')} />Drawing : Rev. –</td>
+                    <td><Chk checked={header.evt_first_issue} onChange={()=>onToggle('evt_first_issue')}/>First issue</td>
+                    <td><Chk checked={header.evt_dan}         onChange={()=>onToggle('evt_dan')}/>DAN</td>
+                    <td><Chk checked={header.concern_drawing} onChange={()=>onToggle('concern_drawing')}/>Drawing : Rev. –</td>
                   </tr>
                   <tr>
-                    <td><Chk checked={header.evt_cv} onChange={() => onToggle('evt_cv')} />CV</td>
-                    <td><Chk checked={header.evt_hin} onChange={() => onToggle('evt_hin')} />HIN</td>
-                    <td><Chk checked={header.concern_actual_part} onChange={() => onToggle('concern_actual_part')} />Actual Part : stage</td>
+                    <td><Chk checked={header.evt_cv}  onChange={()=>onToggle('evt_cv')}/>CV</td>
+                    <td><Chk checked={header.evt_hin} onChange={()=>onToggle('evt_hin')}/>HIN</td>
+                    <td><Chk checked={header.concern_actual_part} onChange={()=>onToggle('concern_actual_part')}/>Actual Part : stage</td>
                   </tr>
                   <tr>
-                    <td><Chk checked={header.evt_mq} onChange={() => onToggle('evt_mq')} />MQ</td>
-                    <td><Chk checked={header.evt_sop} onChange={() => onToggle('evt_sop')} />SOP</td>
-                    <td />
+                    <td><Chk checked={header.evt_mq}  onChange={()=>onToggle('evt_mq')}/>MQ</td>
+                    <td><Chk checked={header.evt_sop} onChange={()=>onToggle('evt_sop')}/>SOP</td>
+                    <td/>
                   </tr>
                 </tbody>
               </table>
             </td>
-            <td className="bp-title" colSpan={9}><b>BILL OF MATERIAL</b></td>
-            <td style={{ textAlign: 'right', verticalAlign: 'top', fontSize: '7px', paddingRight: 4 }}>
-              Page {pageNum} of {totalPages}
-            </td>
-            <td className="bp-sign-outer" colSpan={10} rowSpan={4}>
-              <table className="bp-sign-tbl">
+
+            {/* CENTER BLOCK — title (cols 6-15, colSpan=10) */}
+            <td className="bp-title" colSpan={10}><b>BILL OF MATERIAL</b></td>
+
+            {/* RIGHT BLOCK — Approval boxes (cols 16-25, colSpan=10, spans 4 rows) */}
+            <td className="bp-sign-outer" colSpan={10} rowSpan={4} style={{ height: '1px' }}>
+              <table className="bp-sign-tbl" style={{ height: '100%' }}>
                 <colgroup>
-                  <col style={{ width: '18%' }} />
-                  <col style={{ width: '18%' }} />
-                  <col style={{ width: '18%' }} />
-                  <col style={{ width: '23%' }} />
-                  <col style={{ width: '23%' }} />
+                  <col style={{width:'18%'}}/><col style={{width:'18%'}}/>
+                  <col style={{width:'18%'}}/><col style={{width:'23%'}}/>
+                  <col style={{width:'23%'}}/>
                 </colgroup>
                 <tbody>
                   <tr>
-                    <td colSpan={3}>Pro. Eng.</td>
-                    <td>Purchase</td>
-                    <td>Part control</td>
+                    <td colSpan={5} style={{height:'13px',textAlign:'right',fontSize:'7px',paddingRight:4,borderBottom:'1px solid #333'}}>
+                      Page {pageNum} of {totalPages}
+                    </td>
                   </tr>
                   <tr>
-                    <td>CO-OR</td>
-                    <td>AGM</td>
-                    <td>Mgr.</td>
-                    <td rowSpan={2} />
-                    <td rowSpan={2} />
+                    <td colSpan={3} style={{height: '15px'}}>Pro. Eng.</td>
+                    <td style={{height: '15px'}}>Purchase</td>
+                    <td style={{height: '15px'}}>Part control</td>
                   </tr>
-                  <tr style={{ height: 18 }}>
-                    <td /><td /><td />
+                  <tr>
+                    <td style={{height: '15px'}}>CO-OR</td>
+                    <td style={{height: '15px'}}>AGM</td>
+                    <td style={{height: '15px'}}>Mgr.</td>
+                    <td rowSpan={2} style={{height: '100%'}}></td>
+                    <td rowSpan={2} style={{height: '100%'}}></td>
+                  </tr>
+                  <tr style={{height: '100%'}}>
+                    <td style={{height: '100%'}}></td>
+                    <td style={{height: '100%'}}></td>
+                    <td style={{height: '100%'}}></td>
+                  </tr>
+                  <tr>
+                    <td style={{height: '15px'}}></td>
+                    <td style={{height: '15px'}}></td>
+                    <td style={{height: '15px'}}></td>
+                    <td style={{height: '15px'}}></td>
+                    <td style={{height: '15px'}}></td>
                   </tr>
                 </tbody>
               </table>
             </td>
           </tr>
-          {/* Row 2 — Type | Customer Part No. */}
+
+          {/* ── Row 2: Type | Customer Part No. */}
           <tr>
-            <td className="bp-lbl" colSpan={2}>Type :</td>
-            <td className="bp-val"><b>{bom.type ?? 'HE'}</b></td>
-            <td className="bp-lbl" colSpan={3}>Customer Part No. : <b>{bom.customer_part_no}</b></td>
-            <td colSpan={9} style={{ border: 'none' }} />
-          </tr>
-          {/* Row 3 — Model No. | TGT Part No. | Customer Name | HATC | Date | วันที่ */}
-          <tr>
-            <td className="bp-lbl" colSpan={2}>Model No. :</td>
-            <td className="bp-val"><b>{bom.model}</b></td>
             <td className="bp-lbl" colSpan={3}>
-              TGT Part No. :{' '}
+              <span style={{display:'inline-block', minWidth:58}}>Type</span>: <b>{bom.type ?? 'HE'}</b>
+            </td>
+            <td className="bp-lbl" colSpan={3}>
+              <span style={{display:'inline-block', minWidth:80}}>Customer Part No.</span>: <b>{bom.customer_part_no}</b>
+            </td>
+            <td colSpan={9} style={{border:'none'}}/>
+          </tr>
+
+          {/* ── Row 3: Model No. | TGT Part No. | Customer Name | Date */}
+          <tr>
+            <td className="bp-lbl" colSpan={3}>
+              <span style={{display:'inline-block', minWidth:58}}>Model No.</span>: <b>{bom.model}</b>
+            </td>
+            <td className="bp-lbl" colSpan={3}>
+              <span style={{display:'inline-block', minWidth:80}}>TGT Part No.</span>:{' '}
               <b>
-                {(bom.tgt_history ?? []).map((h, i) => (
-                  <span key={i} style={{ marginRight: 2 }}>
+                {(bom.tgt_history ?? []).map((h,i)=>(
+                  <span key={i} style={{marginRight:2}}>
                     {h.introduced_at > 0 && <span className="bp-tri-hdr">△{h.introduced_at}</span>}
-                    <span className="bp-pn-struck">{h.old_tg_part_no}</span>
-                    {' '}
+                    <span className="bp-pn-struck">{h.old_tg_part_no}</span>{' '}
                   </span>
                 ))}
-                {(bom.tgt_update_level ?? 0) > 0 && (
-                  <span className="bp-tri-hdr">△{bom.tgt_update_level}</span>
-                )}
+                {(bom.tgt_update_level ?? 0) > 0 && <span className="bp-tri-hdr">△{bom.tgt_update_level}</span>}
                 {bom.tg_part_no}
               </b>
             </td>
-            <td className="bp-lbl" colSpan={4}>Customer Name : <b>{bom.customer_name ?? bom.customer}</b></td>
-            <td className="bp-lbl" colSpan={5}>Date : <b>{bom.date}</b></td>
+            <td className="bp-lbl" colSpan={1} rowSpan={2} style={{textAlign: 'center'}}>
+              Customer Name :
+            </td>
+            <td className="bp-val" colSpan={3} rowSpan={2} style={{textAlign: 'center'}}>
+              <b>{bom.customer_name ?? bom.customer}</b>
+            </td>
+            <td className="bp-lbl" colSpan={1} rowSpan={2} style={{textAlign: 'center'}}>
+              Date :
+            </td>
+            <td className="bp-val" colSpan={4} rowSpan={2} style={{textAlign: 'center'}}>
+              <b>{bom.date}</b>
+            </td>
+            {/* 10 columns taken by signature box rowSpan */}
           </tr>
-          {/* Row 4 — Model Name | Part name */}
+
+          {/* ── Row 4: Model Name | Part name */}
           <tr>
-            <td className="bp-lbl" colSpan={2}>Model Name :</td>
-            <td className="bp-val"><b>{bom.model_name}</b></td>
-            <td className="bp-lbl" colSpan={3}>Part name : <b>{bom.part_name}</b></td>
-            <td colSpan={9} style={{ border: 'none' }} />
+            <td className="bp-lbl" colSpan={3}>
+              <span style={{display:'inline-block', minWidth:58}}>Model Name</span>: <b>{bom.model_name}</b>
+            </td>
+            <td className="bp-lbl" colSpan={3}>
+              <span style={{display:'inline-block', minWidth:80}}>Part name</span>: <b>{bom.part_name}</b>
+            </td>
           </tr>
+
         </tbody>
       </table>
 
-      {/* ═══ Main BOM table ════════════════════════════════ */}
+      {/* ══════════════════════════════════════════════════════
+          BLOCK 2 — Main BOM table (15 logical column groups)
+          Physical cols: 5 PartNo + 1 Name + 1 Spec + 1 Qty
+                       + 2 Weight + 1 Price + 5 MatCost
+                       + 4 Supplier + 1 Recie + 1 Code
+                       + 1 Kanban + 1 Lead + 1 Remark = 25
+         ══════════════════════════════════════════════════════ */}
       <table className="bp-bom-tbl">
-        <colgroup>
-          {[85, 85, 85, 85, 85].map((w, i) => <col key={i} style={{ width: w }} />)}
-          <col style={{ width: 160 }} />
-          <col style={{ width: 260 }} />
-          <col style={{ width: 30 }} />
-          <col style={{ width: 26 }} />
-          <col style={{ width: 26 }} /><col style={{ width: 54 }} />
-          {[26, 26, 26, 26, 26].map((w, i) => <col key={i} style={{ width: w }} />)}
-          {[24, 24, 24, 24].map((w, i) => <col key={i} style={{ width: w }} />)}
-          <col style={{ width: 26 }} />
-          <col style={{ width: 30 }} />
-          <col style={{ width: 30 }} />
-          <col style={{ width: 28 }} />
-          <col style={{ width: 36 }} />
-        </colgroup>
+        <Cols />
         <thead>
           <tr>
-            <th colSpan={5} className="bp-th bp-th-group">Part No.</th>
-            <th rowSpan={2} className="bp-th bp-th-name">Part name</th>
-            <th rowSpan={2} className="bp-th bp-th-spec">Material<br />Spec</th>
-            <th rowSpan={2} className="bp-th bp-th-sm">Q'ty<br />(pcs.)</th>
-            <th colSpan={2} className="bp-th bp-th-group">Weight<br />(g./pc.)</th>
-            <th rowSpan={2} className="bp-th bp-th-sm">Price/pcs,<br />kgs (baht)</th>
-            <th colSpan={5} className="bp-th bp-th-group">Material cost/unit (baht)</th>
-            <th colSpan={4} className="bp-th bp-th-group">Supplier</th>
-            <th rowSpan={2} className="bp-th bp-th-xs">Recie-<br />ver</th>
-            <th rowSpan={2} className="bp-th bp-th-xs">Internal<br />Code</th>
-            <th rowSpan={2} className="bp-th bp-th-xs">Q'ty/<br />kanban<br />(pcs,kgs)</th>
-            <th rowSpan={2} className="bp-th bp-th-xs">Lead<br />time<br />(day)</th>
-            <th rowSpan={2} className="bp-th bp-th-remark">Remark</th>
+            <th colSpan={5}  className="bp-th bp-th-group">Part No.</th>
+            <th rowSpan={2}  className="bp-th bp-th-name">Part name</th>
+            <th rowSpan={2}  className="bp-th bp-th-spec">Material<br/>Spec</th>
+            <th rowSpan={2}  className="bp-th bp-th-sm">Q'ty<br/>(pcs.)</th>
+            <th colSpan={2}  className="bp-th bp-th-group">Weight<br/>(g./pc.)</th>
+            <th rowSpan={2}  className="bp-th bp-th-sm">Price/pcs,<br/>kgs (baht)</th>
+            <th colSpan={5}  className="bp-th bp-th-group">Material cost/unit (baht)</th>
+            <th colSpan={4}  className="bp-th bp-th-group">Supplier</th>
+            <th rowSpan={2}  className="bp-th bp-th-xs">Recie-<br/>ver</th>
+            <th rowSpan={2}  className="bp-th bp-th-xs">Internal<br/>Code</th>
+            <th rowSpan={2}  className="bp-th bp-th-xs">Q'ty/<br/>kanban<br/>(pcs,kgs)</th>
+            <th rowSpan={2}  className="bp-th bp-th-xs">Lead<br/>time<br/>(day)</th>
+            <th rowSpan={2}  className="bp-th bp-th-remark">Remark</th>
           </tr>
           <tr>
-            {[1, 2, 3, 4, 5].map(n => <th key={n} className="bp-th bp-th-pn">{n}</th>)}
+            {[1,2,3,4,5].map(n=><th key={n} className="bp-th bp-th-pn">{n}</th>)}
             <th className="bp-th bp-th-xs">Part</th>
             <th className="bp-th bp-th-xs">Gate</th>
-            {[1, 2, 3, 4, 5].map(n => <th key={n} className="bp-th bp-th-xs">{n}</th>)}
-            {['M/C', 'T/T', 'Local', 'Import'].map(s => <th key={s} className="bp-th bp-th-xs">{s}</th>)}
+            {[1,2,3,4,5].map(n=><th key={n} className="bp-th bp-th-xs">{n}</th>)}
+            {['M/C','T/T','Local','Import'].map(s=><th key={s} className="bp-th bp-th-xs">{s}</th>)}
           </tr>
         </thead>
         <tbody>
-          {rows.map((row, i) => <BomRow key={i} row={row} />)}
+          {rows.map((row,i)=><BomRow key={i} row={row}/>)}
         </tbody>
         <tfoot>
           <tr>
-            <td colSpan={5} className="bp-mark">A</td>
-            <td colSpan={1} className="bp-mark">A</td>
-            <td colSpan={1} className="bp-mark">A</td>
-            <td colSpan={2} className="bp-mark">A</td>
-            <td colSpan={2} className="bp-mark">C</td>
-            <td colSpan={5} className="bp-mark">C</td>
-            <td colSpan={4} className="bp-mark">C</td>
-            <td colSpan={1} className="bp-mark">B</td>
-            <td colSpan={1} className="bp-mark">B</td>
-            <td colSpan={1} className="bp-mark">B</td>
-            <td colSpan={2} className="bp-mark">C</td>
+            {/* A = Engineering, B = Part Control, C = Purchase */}
+            <td colSpan={5}  className="bp-mark">A</td>
+            <td colSpan={1}  className="bp-mark">A</td>
+            <td colSpan={1}  className="bp-mark">A</td>
+            <td colSpan={2}  className="bp-mark">A</td>
+            <td colSpan={2}  className="bp-mark">C</td>
+            <td colSpan={5}  className="bp-mark">C</td>
+            <td colSpan={4}  className="bp-mark">C</td>
+            <td colSpan={1}  className="bp-mark">B</td>
+            <td colSpan={1}  className="bp-mark">B</td>
+            <td colSpan={1}  className="bp-mark">B</td>
+            <td colSpan={2}  className="bp-mark">C</td>
           </tr>
         </tfoot>
       </table>
 
-      {/* ═══ Bottom: Note + Revision + Route ══════════════ */}
+      {/* ══════════════════════════════════════════════════════
+          BLOCK 3 — Footer: Note | Revision Record | Route
+          Uses same <Cols/> colgroup so columns align with BOM table above.
+          Note = cols 1-6 (colSpan=6)
+          Mark = col 7  (colSpan=1)   ← same as Material Spec
+          Rev  = cols 8-17 (colSpan=10) ← Q'ty(pcs.) … M/C
+          ECI  = cols 18-19 (colSpan=2) ← T/T … Local
+          Date = cols 20-21 (colSpan=2) ← Import … Recie-ver
+          Rsnr = cols 22-23 (colSpan=2) ← Internal Code … Q'ty/kanban
+          Appr = cols 24-25 (colSpan=2) ← Lead time … Remark
+         ══════════════════════════════════════════════════════ */}
       <table className="bp-bot-tbl">
+        <Cols />
         <tbody>
+          {/* Row 1: Note (no rowSpan — fits content) + revision headers */}
           <tr>
-            <td className="bp-note-cell">
-              <div style={{ fontWeight: 700, marginBottom: 2 }}>Note :</div>
+            <td className="bp-note-cell" colSpan={6}>
+              <div style={{fontWeight:700,marginBottom:2}}>Note :</div>
               <div className="bp-note-line">- First issue</div>
               <div className="bp-note-line">'A' = Record by Engineering section&nbsp;&nbsp;Update ECI No.</div>
               <div className="bp-note-line">'B' = Record by Part Control section</div>
               <div className="bp-note-line">'C' = Record by Purchase section</div>
             </td>
-            <td style={{ padding: 0 }}>
-              <table className="bp-rev-tbl">
-                <thead>
-                  <tr>
-                    <th className="bp-rev-th" style={{ width: 28 }}>Mark</th>
-                    <th className="bp-rev-th" style={{ width: 80 }}>Revision record</th>
-                    <th className="bp-rev-th" style={{ width: 60 }}>ECI No.</th>
-                    <th className="bp-rev-th" style={{ width: 70 }}>Date</th>
-                    <th className="bp-rev-th" style={{ width: 90 }}>Revisioner</th>
-                    <th className="bp-rev-th" style={{ width: 90 }}>Approved</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {revisions.map((rev, i) => {
-                    const isFirst = !rev.mark || rev.mark === '–' || rev.mark === '-'
-                    const markDisplay = isFirst ? '△' : `△${rev.mark}`
-                    return (
-                      <tr key={i}>
-                        <td className="bp-rev-td" style={{ textAlign: 'center' }}>{markDisplay}</td>
-                        <td className="bp-rev-td">{rev.revision_record ?? ''}</td>
-                        <td className="bp-rev-td" style={{ textAlign: 'center' }}>{rev.eci_no ?? ''}</td>
-                        <td className="bp-rev-td" style={{ textAlign: 'center' }}>{rev.revision_date ?? ''}</td>
-                        <td className="bp-rev-td">
-                          {isFirst
-                            ? <input className="bp-rev-input" value={header.revisioner} onChange={e => onField('revisioner', e.target.value)} placeholder="ผู้แก้ไข" />
-                            : rev.revisioner ?? ''}
-                        </td>
-                        <td className="bp-rev-td">
-                          {isFirst
-                            ? <input className="bp-rev-input" value={header.approved_by} onChange={e => onField('approved_by', e.target.value)} placeholder="ผู้อนุมัติ" />
-                            : rev.approved_by ?? ''}
-                        </td>
-                      </tr>
-                    )
-                  })}
-                  {Array(Math.max(0, 5 - revisions.length)).fill(null).map((_, i) => (
-                    <tr key={`e${i}`}>
-                      <td className="bp-rev-td" /><td className="bp-rev-td" />
-                      <td className="bp-rev-td" /><td className="bp-rev-td" />
-                      <td className="bp-rev-td" /><td className="bp-rev-td" />
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </td>
+            <td className="bp-rev-th" colSpan={1}>Mark</td>
+            <td className="bp-rev-th" colSpan={10}>Revision record</td>
+            <td className="bp-rev-th" colSpan={2}>ECI No.</td>
+            <td className="bp-rev-th" colSpan={2}>Date</td>
+            <td className="bp-rev-th" colSpan={2}>Revisioner</td>
+            <td className="bp-rev-th" colSpan={2}>Approved</td>
           </tr>
+          {/* Revision data rows — cols 1-6 are invisible spacers */}
+          {revisions.map((rev,i)=>{
+            const isFirst = !rev.mark || rev.mark === '–' || rev.mark === '-'
+            return (
+              <tr key={i}>
+                <td colSpan={6} className="bp-bot-spacer"/>
+                <td className="bp-rev-td" colSpan={1} style={{textAlign:'center'}}>{isFirst ? '△' : `△${rev.mark}`}</td>
+                <td className="bp-rev-td" colSpan={10}>{rev.revision_record ?? ''}</td>
+                <td className="bp-rev-td" colSpan={2} style={{textAlign:'center'}}>{rev.eci_no ?? ''}</td>
+                <td className="bp-rev-td" colSpan={2} style={{textAlign:'center'}}>{rev.revision_date ?? ''}</td>
+                <td className="bp-rev-td" colSpan={2}>
+                  {isFirst
+                    ? <input className="bp-rev-input" value={header.revisioner} onChange={e=>onField('revisioner',e.target.value)} placeholder="ผู้แก้ไข"/>
+                    : rev.revisioner ?? ''}
+                </td>
+                <td className="bp-rev-td" colSpan={2}>
+                  {isFirst
+                    ? <input className="bp-rev-input" value={header.approved_by} onChange={e=>onField('approved_by',e.target.value)} placeholder="ผู้อนุมัติ"/>
+                    : rev.approved_by ?? ''}
+                </td>
+              </tr>
+            )
+          })}
+          {Array(Math.max(0,5-revisions.length)).fill(null).map((_,i)=>(
+            <tr key={`e${i}`}>
+              <td colSpan={6} className="bp-bot-spacer"/>
+              <td className="bp-rev-td" colSpan={1}/>
+              <td className="bp-rev-td" colSpan={10}/>
+              <td className="bp-rev-td" colSpan={2}/>
+              <td className="bp-rev-td" colSpan={2}/>
+              <td className="bp-rev-td" colSpan={2}/>
+              <td className="bp-rev-td" colSpan={2}/>
+            </tr>
+          ))}
+          {/* Route row */}
           <tr>
-            <td colSpan={2} style={{ padding: '2px 4px' }}>
+            <td colSpan={6} className="bp-bot-spacer"/>
+            <td className="bp-route-cell" colSpan={19}>
               <div className="bp-route">
                 <span className="bp-route-lbl">ROUTE :</span>
                 <span className="bp-route-box">Production Eng.</span>
                 <span className="bp-route-arr">→</span>
-                <span className="bp-route-note">Before OTS = 2 months or<br />1 weeks after each event</span>
+                <span className="bp-route-note">Before OTS = 2 months or<br/>1 weeks after each event</span>
                 <span className="bp-route-arr">→</span>
                 <span className="bp-route-box">Purchase</span>
                 <span className="bp-route-arr">→</span>
@@ -496,7 +679,9 @@ function BomPage({ bom, header, onToggle, onField, rows, pageNum, totalPages }) 
         </tbody>
       </table>
 
+      {/* Document code — bottom left (matches FM-PE30/SSE-007 in reference) */}
       <div className="bp-footer">FM-PE30/SSE-007 Rev.01 (14/OCT/14) Approved SSE</div>
+
     </div>
   )
 }
@@ -522,8 +707,9 @@ function BomRow({ row }) {
   )
 
   const lv = row.level ?? 1
-  const history = Array.isArray(row.history) ? row.history : []
   const updateLevel = row.update_level ?? 0
+  const isRevisedOut = row.status === 'revised_out'
+  const displayLevel = isRevisedOut ? updateLevel - 1 : updateLevel
 
   const spec = [
     row.note,
@@ -532,23 +718,13 @@ function BomRow({ row }) {
   ].filter(Boolean).join('  ')
 
   return (
-    <tr className={`bp-row bp-row-lv${lv}`}>
+    <tr className={`bp-row bp-row-lv${lv}${isRevisedOut ? ' bp-row-revised-out' : ''}`}>
       {[1, 2, 3, 4, 5].map(n => (
         <td key={n} className={`bp-td bp-td-pn bp-td-pn${n}`}>
           {n === lv ? (
             <div className="bp-pn-cell">
-              {/* History: old part nos with strikethrough */}
-              {history.map(h => (
-                h.old_tg_part_no ? (
-                  <div key={h.superseded_at} className="bp-pn-line">
-                    {h.introduced_at > 0 && <span className="bp-tri-mark">△{h.introduced_at}</span>}
-                    <span className="bp-pn-struck">{h.old_tg_part_no}</span>
-                  </div>
-                ) : null
-              ))}
-              {/* Current part no */}
               <div className="bp-pn-line">
-                {updateLevel > 0 && <span className="bp-tri-mark">△{updateLevel}</span>}
+                {displayLevel > 0 && <span className="bp-tri-mark">△{displayLevel}</span>}
                 <span>{row.tg_part_no ?? ''}</span>
               </div>
             </div>

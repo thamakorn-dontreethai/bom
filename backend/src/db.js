@@ -13,6 +13,69 @@ export const pool = new Pool({
 pool.on('connect', client => client.query('SET search_path TO tg, public'))
 
 export async function initDb() {
+  // migration_001 — run every start (all statements are idempotent)
+  await pool.query(`
+    ALTER TABLE tg.design_spec
+      ADD COLUMN IF NOT EXISTS evt_first_issue     BOOLEAN NOT NULL DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS evt_cv              BOOLEAN NOT NULL DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS evt_mq              BOOLEAN NOT NULL DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS evt_dan             BOOLEAN NOT NULL DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS evt_hin             BOOLEAN NOT NULL DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS evt_sop             BOOLEAN NOT NULL DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS concern_drawing     BOOLEAN NOT NULL DEFAULT FALSE,
+      ADD COLUMN IF NOT EXISTS concern_actual_part BOOLEAN NOT NULL DEFAULT FALSE
+  `)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tg.bom_revision (
+      revision_id     BIGSERIAL PRIMARY KEY,
+      design_spec_id  BIGINT NOT NULL REFERENCES tg.design_spec(design_spec_id) ON DELETE CASCADE,
+      sort_order      SMALLINT NOT NULL DEFAULT 0,
+      mark            VARCHAR(20),
+      revision_record TEXT,
+      eci_no          VARCHAR(50),
+      revision_date   DATE,
+      revisioner      VARCHAR(100),
+      approved_by     VARCHAR(100)
+    )
+  `)
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_bom_revision_ds
+      ON tg.bom_revision(design_spec_id, sort_order)
+  `)
+  await pool.query(`
+    ALTER TABLE tg.bom ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'active'
+  `)
+  await pool.query(`UPDATE tg.bom SET status='active' WHERE status IS NULL`)
+
+  // migration_002 — bom revision history + tgt part no history
+  await pool.query(`
+    ALTER TABLE tg.bom
+      ADD COLUMN IF NOT EXISTS update_level SMALLINT NOT NULL DEFAULT 0
+  `)
+  await pool.query(`
+    ALTER TABLE tg.design_spec
+      ADD COLUMN IF NOT EXISTS tgt_update_level SMALLINT NOT NULL DEFAULT 0
+  `)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tg.bom_item_history (
+      id                  BIGSERIAL PRIMARY KEY,
+      bom_id              BIGINT NOT NULL REFERENCES tg.bom(bom_id) ON DELETE CASCADE,
+      introduced_at       SMALLINT NOT NULL DEFAULT 0,
+      superseded_at       SMALLINT NOT NULL DEFAULT 0,
+      old_tg_part_no      VARCHAR(100),
+      old_customer_part_no VARCHAR(100)
+    )
+  `)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tg.design_spec_tgt_history (
+      id              BIGSERIAL PRIMARY KEY,
+      design_spec_id  BIGINT NOT NULL REFERENCES tg.design_spec(design_spec_id) ON DELETE CASCADE,
+      introduced_at   SMALLINT NOT NULL DEFAULT 0,
+      superseded_at   SMALLINT NOT NULL DEFAULT 0,
+      old_tg_part_no  VARCHAR(100)
+    )
+  `)
+
   const { rows } = await pool.query('SELECT COUNT(*) AS cnt FROM tg.bom')
   if (parseInt(rows[0].cnt) === 0) {
     console.log('Seeding tg.bom…')

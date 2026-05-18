@@ -38,9 +38,11 @@ const HEADER_SELECT = `
 const ITEMS_SQL = `
   WITH it AS (
     SELECT b.bom_id, b.variant_id, b.parent_part_id, b.child_part_id,
-           b.bom_level, b.level_code, b.quantity, b.sort_order, b.notes AS bom_notes
+           b.bom_level, b.level_code, b.quantity, b.sort_order, b.notes AS bom_notes,
+           b.update_level, b.status
     FROM tg.bom b
     WHERE b.design_spec_id = $1
+      AND (b.status IS NULL OR b.status <> 'obsolete')
   )
   SELECT
     it.bom_id                                                  AS id,
@@ -66,7 +68,10 @@ const ITEMS_SQL = `
     co.color_code                                              AS color_no,
     co.color_tone,
     p.jis_standard                                             AS sa,
-    COALESCE(it.bom_notes, p.notes)                           AS note
+    COALESCE(it.bom_notes, p.notes)                           AS note,
+    it.sort_order,
+    it.update_level,
+    it.status
   FROM it
   JOIN tg.part p ON it.child_part_id = p.part_id
   LEFT JOIN LATERAL (
@@ -245,27 +250,77 @@ router.post('/:id/revision', async (req, res) => {
     // Process each changed item
     for (const { bom_id, new_part_no } of items) {
       if (!new_part_no?.trim()) continue
+
+      // ดึงข้อมูล bom row เดิม + part เดิม
       const { rows: cur } = await client.query(
-        `SELECT b.update_level, p.tg_part_no, p.customer_part_no, p.part_id
+        `SELECT b.update_level, b.sort_order, b.variant_id, b.parent_part_id,
+                b.bom_level, b.level_code, b.quantity,
+                p.tg_part_no, p.customer_part_no, p.part_id,
+                p.part_name, p.mass_gram, p.product_standard, p.material_standard,
+                p.is_purchased_material, p.reg_certif_required, p.notes
          FROM tg.bom b JOIN tg.part p ON p.part_id = b.child_part_id
          WHERE b.bom_id = $1 AND b.design_spec_id = $2`,
         [bom_id, dsId]
       )
       if (!cur.length) continue
       const c = cur[0]
+
+      // บันทึก history
       await client.query(
         `INSERT INTO tg.bom_item_history
            (bom_id, introduced_at, superseded_at, old_tg_part_no, old_customer_part_no)
          VALUES ($1, $2, $3, $4, $5)`,
         [bom_id, c.update_level, newLevel, c.tg_part_no, c.customer_part_no]
       )
+
+      // นับ update_level เฉพาะ part นี้ (ไม่ใช่ global)
+      const partUpdateLevel = (parseInt(c.update_level) || 0) + 1
+
+      // mark row เดิมเป็น revised_out (แสดงขีดฆ่า ไม่ลบ)
       await client.query(
-        'UPDATE tg.bom SET update_level = $1 WHERE bom_id = $2',
-        [newLevel, bom_id]
+        `UPDATE tg.bom SET status='revised_out', update_level=$1 WHERE bom_id=$2`,
+        [partUpdateLevel, bom_id]
       )
+
+      // หา part ใหม่หรือสร้างใหม่
+      const newPn = new_part_no.trim()
+      let newPartId
+      const { rows: existPart } = await client.query(
+        'SELECT part_id FROM tg.part WHERE tg_part_no=$1', [newPn]
+      )
+      if (existPart.length) {
+        newPartId = existPart[0].part_id
+      } else {
+        const r = await client.query(
+          `INSERT INTO tg.part
+             (tg_part_no, customer_part_no, part_name, mass_gram,
+              product_standard, material_standard, notes,
+              is_purchased_material, reg_certif_required)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING part_id`,
+          [newPn, c.customer_part_no, c.part_name, c.mass_gram,
+           c.product_standard, c.material_standard, c.notes,
+           c.is_purchased_material, c.reg_certif_required]
+        )
+        newPartId = r.rows[0].part_id
+      }
+
+      // เลื่อน sort_order ของแถวที่อยู่ถัดจาก row เดิมออกก่อน (+1)
       await client.query(
-        'UPDATE tg.part SET tg_part_no = $1, updated_at = NOW() WHERE part_id = $2',
-        [new_part_no.trim(), c.part_id]
+        `UPDATE tg.bom SET sort_order = sort_order + 1
+         WHERE design_spec_id = $1 AND sort_order > $2`,
+        [dsId, c.sort_order]
+      )
+
+      // INSERT row ใหม่ต่อจาก row เดิมทันที
+      await client.query(
+        `INSERT INTO tg.bom
+           (design_spec_id, variant_id, parent_part_id, child_part_id,
+            bom_level, level_code, quantity, sort_order, status, update_level)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9)`,
+        [dsId, c.variant_id, c.parent_part_id, newPartId,
+         c.bom_level, c.level_code, c.quantity,
+         parseInt(c.sort_order) + 1,
+         partUpdateLevel]
       )
     }
 
@@ -404,6 +459,43 @@ router.delete('/:id/items/:itemId', async (req, res) => {
     res.json({ deleted: true })
   } catch (e) {
     res.status(500).json({ error: e.message })
+  }
+})
+
+// DELETE /api/bom/:id/revisions/reset — ลบข้อมูล revision ทั้งหมดและ reset กลับสู่สภาพเริ่มต้น
+router.delete('/:id/revisions/reset', async (req, res) => {
+  const dsId = parseInt(req.params.id)
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+
+    // ลบ bom_revision records ทั้งหมด
+    await client.query('DELETE FROM tg.bom_revision WHERE design_spec_id=$1', [dsId])
+
+    // ลบ bom rows ที่เป็น revised_out (ของที่เพิ่มจาก test)
+    await client.query(
+      `DELETE FROM tg.bom WHERE design_spec_id=$1 AND status='revised_out'`, [dsId]
+    )
+
+    // ลบ bom_item_history ทั้งหมดของ BOM นี้
+    await client.query(
+      `DELETE FROM tg.bom_item_history
+       WHERE bom_id IN (SELECT bom_id FROM tg.bom WHERE design_spec_id=$1)`,
+      [dsId]
+    )
+
+    // reset update_level ของทุก bom row กลับเป็น 0
+    await client.query(
+      `UPDATE tg.bom SET update_level=0, status='active' WHERE design_spec_id=$1`, [dsId]
+    )
+
+    await client.query('COMMIT')
+    res.json({ reset: true })
+  } catch (e) {
+    await client.query('ROLLBACK')
+    res.status(500).json({ error: e.message })
+  } finally {
+    client.release()
   }
 })
 
