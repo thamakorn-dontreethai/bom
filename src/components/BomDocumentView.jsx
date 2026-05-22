@@ -1,6 +1,7 @@
-import { useRef, useState } from 'react'
+import { useRef, useState, useEffect } from 'react'
 import jsPDF from 'jspdf'
 import html2canvas from 'html2canvas'
+import { exportBomToExcel } from '../utils/exportBomExcel'
 
 // Follow the sort_order chain from a revised_out through any intermediate revised_out rows
 // to the final active replacement. Handles A(revised)→B(revised)→C(active) chains.
@@ -193,12 +194,44 @@ function groupByKey(items) {
   })
 }
 
+function Cols() {
+  return (
+    <colgroup>
+      {[85,85,85,85,85].map((w,i)=><col key={`pn${i}`} style={{width:w}}/>)}
+      <col style={{width:160}}/><col style={{width:260}}/>
+      <col style={{width:30}}/><col style={{width:26}}/>
+      <col style={{width:26}}/><col style={{width:54}}/>
+      {[26,26,26,26,26].map((w,i)=><col key={`mc${i}`} style={{width:w}}/>)}
+      {[24,24,24,24].map((w,i)=><col key={`sp${i}`} style={{width:w}}/>)}
+      <col style={{width:26}}/><col style={{width:30}}/>
+      <col style={{width:30}}/><col style={{width:28}}/>
+      <col style={{width:36}}/>
+    </colgroup>
+  )
+}
+
 export default function BomDocumentView({ bom, onRefresh }) {
   const pageRefs = useRef([])
   const [busy, setBusy] = useState(false)
   const [saving, setSaving] = useState(false)
   const [saveMsg, setSaveMsg] = useState(null)
+  const [refreshing, setRefreshing] = useState(false)
+  const [blinking, setBlinking] = useState(false)
   const [showRevDialog, setShowRevDialog] = useState(false)
+  const [showApprovalDialog, setShowApprovalDialog] = useState(false)
+  const [approvalEmail, setApprovalEmail] = useState('')
+  const [approvalStatus, setApprovalStatus] = useState(null) // null | 'sending' | 'ok' | 'err:...'
+
+  // Subscribe to SSE stream after email sent — instant notification when approved
+  useEffect(() => {
+    if (approvalStatus !== 'ok') return
+    const es = new EventSource(`/api/approval/events/${bom.id}`)
+    es.addEventListener('approved', () => {
+      onRefresh?.()
+      es.close()
+    })
+    return () => es.close()
+  }, [approvalStatus])
 
   const [header, setHeader] = useState({
     evt_first_issue: bom.evt_first_issue ?? false,
@@ -211,7 +244,46 @@ export default function BomDocumentView({ bom, onRefresh }) {
     concern_actual_part: bom.concern_actual_part ?? false,
     revisioner: bom.prepared_by ?? '',
     approved_by: bom.approved_by ?? '',
+    customer_name: bom.customer_name ?? bom.customer ?? '',
   })
+
+  // editable revisioner/approved_by for every non-first revision row
+  const [revNames, setRevNames] = useState(() => {
+    const m = {}
+    ;(bom.revisions ?? []).forEach(r => {
+      if (r.mark && r.mark !== '–' && r.mark !== '-') {
+        m[r.mark] = { revisioner: r.revisioner ?? '', approved_by: r.approved_by ?? '' }
+      }
+    })
+    return m
+  })
+
+  useEffect(() => {
+    setHeader({
+      evt_first_issue: bom.evt_first_issue ?? false,
+      evt_cv: bom.evt_cv ?? false,
+      evt_mq: bom.evt_mq ?? false,
+      evt_dan: bom.evt_dan ?? false,
+      evt_hin: bom.evt_hin ?? false,
+      evt_sop: bom.evt_sop ?? false,
+      concern_drawing: bom.concern_drawing ?? false,
+      concern_actual_part: bom.concern_actual_part ?? false,
+      revisioner: bom.prepared_by ?? '',
+      approved_by: bom.approved_by ?? '',
+      customer_name: bom.customer_name ?? bom.customer ?? '',
+    })
+    const m = {}
+    ;(bom.revisions ?? []).forEach(r => {
+      if (r.mark && r.mark !== '–' && r.mark !== '-') {
+        m[r.mark] = { revisioner: r.revisioner ?? '', approved_by: r.approved_by ?? '' }
+      }
+    })
+    setRevNames(m)
+  }, [bom])
+
+  function setRevName(mark, field, val) {
+    setRevNames(prev => ({ ...prev, [mark]: { ...(prev[mark] ?? {}), [field]: val } }))
+  }
 
   function onToggle(key) { setHeader(h => ({ ...h, [key]: !h[key] })) }
   function onField(key, val) { setHeader(h => ({ ...h, [key]: val })) }
@@ -223,7 +295,10 @@ export default function BomDocumentView({ bom, onRefresh }) {
       const r = await fetch(`/api/bom/${bom.id}/header`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(header),
+        body: JSON.stringify({
+          ...header,
+          rev_names: Object.entries(revNames).map(([mark, v]) => ({ mark, ...v })),
+        }),
       })
       if (!r.ok) throw new Error()
       setSaveMsg('ok')
@@ -247,6 +322,7 @@ export default function BomDocumentView({ bom, onRefresh }) {
       const availW = pw - margin * 2
       const availH = ph - margin * 2
       const targetPx = Math.round((availW / 25.4) * 96)
+      const targetPxH = Math.round((availH / 25.4) * 96)
 
       for (let i = 0; i < refs.length; i++) {
         const el = refs[i]
@@ -256,28 +332,48 @@ export default function BomDocumentView({ bom, onRefresh }) {
           useCORS: true,
           backgroundColor: '#fff',
           windowWidth: targetPx,
+          windowHeight: targetPxH,
           onclone: (_doc, clonedEl) => {
             clonedEl.style.width = targetPx + 'px'
             clonedEl.style.minWidth = targetPx + 'px'
             clonedEl.style.maxWidth = targetPx + 'px'
             clonedEl.style.boxSizing = 'border-box'
+            // Expand empty rows so grid fills full A3 height and footer sits at bottom
+            const hdrTbl = clonedEl.querySelector('table.bp-hdr-tbl')
+            const bomTbl = clonedEl.querySelector('table.bp-bom-tbl')
+            const botTbl = clonedEl.querySelector('table.bp-bot-tbl')
+            if (hdrTbl && bomTbl && botTbl) {
+              const hdrH = hdrTbl.getBoundingClientRect().height
+              const botH = botTbl.getBoundingClientRect().height
+              const bomAvailH = targetPxH - hdrH - botH - 10.5
+              const theadH = Array.from(bomTbl.querySelectorAll('thead tr'))
+                .reduce((s, tr) => s + tr.getBoundingClientRect().height, 0)
+              const tfootH = Array.from(bomTbl.querySelectorAll('tfoot tr'))
+                .reduce((s, tr) => s + tr.getBoundingClientRect().height, 0)
+              const tbodyRows = Array.from(bomTbl.querySelectorAll('tbody tr'))
+              const rowH = (bomAvailH - theadH - tfootH) / tbodyRows.length
+              if (rowH > 0) tbodyRows.forEach(tr => { tr.style.height = rowH + 'px' })
+            }
             _doc.querySelectorAll('input.bp-rev-input').forEach(inp => {
               const span = _doc.createElement('span')
               span.textContent = inp.value
               span.style.cssText = 'font-family:Arial,sans-serif;font-size:7.5px;color:#000;display:inline-block;width:100%'
               inp.parentNode.replaceChild(span, inp)
             })
+            _doc.querySelectorAll('.bp-row-revised-out td').forEach(td => {
+              td.style.textDecoration = 'line-through'
+              td.style.color = '#cc0000'
+              td.querySelectorAll('div, span').forEach(el => {
+                el.style.textDecoration = 'line-through'
+                el.style.color = '#cc0000'
+              })
+            })
           },
         })
         const ratio = canvas.height / canvas.width
         const iw = availW
         const ih = iw * ratio
-        let y = 0
-        while (y < ih) {
-          if (y > 0) pdf.addPage()
-          pdf.addImage(canvas.toDataURL('image/jpeg', 0.92), 'JPEG', margin, margin - y, iw, ih)
-          y += availH
-        }
+        pdf.addImage(canvas.toDataURL('image/jpeg', 0.92), 'JPEG', margin, margin, iw, ih)
       }
       pdf.save(`BOM-${bom.tg_part_no ?? bom.model ?? bom.id}.pdf`)
     } catch (e) {
@@ -287,6 +383,80 @@ export default function BomDocumentView({ bom, onRefresh }) {
     }
   }
 
+  async function generatePdfBase64() {
+    const refs = pageRefs.current.filter(Boolean)
+    if (!refs.length) return null
+    const pdf = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a3' })
+    const pw = pdf.internal.pageSize.getWidth()
+    const ph = pdf.internal.pageSize.getHeight()
+    const margin = 5
+    const availW = pw - margin * 2
+    const availH = ph - margin * 2
+    const targetPx = Math.round((availW / 25.4) * 96)
+    const targetPxH = Math.round((availH / 25.4) * 96)
+    for (let i = 0; i < refs.length; i++) {
+      if (i > 0) pdf.addPage()
+      const canvas = await html2canvas(refs[i], {
+        scale: 2, useCORS: true, backgroundColor: '#fff', windowWidth: targetPx, windowHeight: targetPxH,
+        onclone: (_doc, clonedEl) => {
+          clonedEl.style.width = targetPx + 'px'
+          clonedEl.style.minWidth = targetPx + 'px'
+          clonedEl.style.maxWidth = targetPx + 'px'
+          clonedEl.style.boxSizing = 'border-box'
+          const hdrTbl2 = clonedEl.querySelector('table.bp-hdr-tbl')
+          const bomTbl2 = clonedEl.querySelector('table.bp-bom-tbl')
+          const botTbl2 = clonedEl.querySelector('table.bp-bot-tbl')
+          if (hdrTbl2 && bomTbl2 && botTbl2) {
+            const hdrH = hdrTbl2.getBoundingClientRect().height
+            const botH = botTbl2.getBoundingClientRect().height
+            const bomAvailH = targetPxH - hdrH - botH - 10.5
+            const theadH2 = Array.from(bomTbl2.querySelectorAll('thead tr'))
+              .reduce((s, tr) => s + tr.getBoundingClientRect().height, 0)
+            const tfootH2 = Array.from(bomTbl2.querySelectorAll('tfoot tr'))
+              .reduce((s, tr) => s + tr.getBoundingClientRect().height, 0)
+            const tbodyRows2 = Array.from(bomTbl2.querySelectorAll('tbody tr'))
+            const rowH2 = (bomAvailH - theadH2 - tfootH2) / tbodyRows2.length
+            if (rowH2 > 0) tbodyRows2.forEach(tr => { tr.style.height = rowH2 + 'px' })
+          }
+          _doc.querySelectorAll('input.bp-rev-input').forEach(inp => {
+            const span = _doc.createElement('span')
+            span.textContent = inp.value
+            span.style.cssText = 'font-family:Arial,sans-serif;font-size:7.5px;color:#000;display:inline-block;width:100%'
+            inp.parentNode.replaceChild(span, inp)
+          })
+          _doc.querySelectorAll('.bp-row-revised-out td').forEach(td => {
+            td.style.textDecoration = 'line-through'
+            td.style.color = '#cc0000'
+          })
+        },
+      })
+      const ratio2 = canvas.height / canvas.width
+      pdf.addImage(canvas.toDataURL('image/jpeg', 0.92), 'JPEG', margin, margin, availW, availW * ratio2)
+    }
+    return await new Promise((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => resolve(reader.result.replace(/^data:application\/pdf;base64,/, ''))
+      reader.onerror = reject
+      reader.readAsDataURL(pdf.output('blob'))
+    })
+  }
+
+  async function sendApproval() {
+    if (!approvalEmail) return
+    setApprovalStatus('sending')
+    try {
+      const pdfBase64 = await generatePdfBase64()
+      const r = await fetch('/api/approval/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ bomId: bom.id, recipientEmail: approvalEmail, pdfBase64 }),
+      })
+      const data = await r.json()
+      if (r.ok) { setApprovalStatus('ok') }
+      else { setApprovalStatus('err:' + (data.detail ?? data.error ?? 'unknown')) }
+    } catch (e) { setApprovalStatus('err:' + e.message) }
+  }
+
   const groups = groupByKey(bom.items ?? [])
   const pages = groups.length > 0 ? groups : [{ key: '0', label: '', rows: [] }]
   const total = pages.length
@@ -294,18 +464,17 @@ export default function BomDocumentView({ bom, onRefresh }) {
   return (
     <div className="bdv-wrap">
       <div className="bdv-toolbar">
-        {saveMsg === 'ok' && <span className="bdv-save-msg bdv-save-msg--ok">✓ บันทึกแล้ว</span>}
-        {saveMsg === 'err' && <span className="bdv-save-msg bdv-save-msg--err">⚠ บันทึกไม่สำเร็จ</span>}
+        {/* group 1 — save */}
         <button className="bdv-btn bdv-btn--secondary" onClick={saveHeader} disabled={saving || busy}>
-          {saving ? 'กำลังบันทึก…' : 'บันทึก'}
+          {saving ? 'กำลังบันทึก…' : '💾 บันทึก'}
         </button>
-        <button
-          className="bdv-btn bdv-btn--rev"
-          onClick={() => setShowRevDialog(true)}
-          disabled={busy || saving}
-        >
-          △ บันทึก Update
+        <button className="bdv-btn bdv-btn--rev" onClick={() => setShowRevDialog(true)} disabled={busy || saving}>
+          บันทึก Update
         </button>
+
+        <div className="bdv-toolbar-sep" />
+
+        {/* group 2 — danger */}
         <button
           className="bdv-btn bdv-btn--danger"
           disabled={busy || saving}
@@ -315,13 +484,78 @@ export default function BomDocumentView({ bom, onRefresh }) {
             onRefresh?.()
           }}
         >
-          ↺ Reset Revision
+          ↺ Reset
         </button>
+
+        <div className="bdv-toolbar-sep" />
+
+        {/* group 3 — export */}
         <button className="bdv-btn" onClick={download} disabled={busy || saving}>
-          {busy ? 'กำลัง Generate…' : '⬇ Download PDF'}
+          {busy ? 'กำลัง Generate…' : '⬇ PDF'}
         </button>
+        <button className="bdv-btn bdv-btn--excel" onClick={() => exportBomToExcel(bom)} disabled={busy || saving}>
+          📊 Excel
+        </button>
+
+        <div className="bdv-toolbar-sep" />
+
+        {/* group 4 — utility */}
+        <button
+          className="bdv-btn bdv-btn--secondary"
+          disabled={busy || saving || refreshing}
+          onClick={async () => { setRefreshing(true); setBlinking(true); await onRefresh?.(); setRefreshing(false) }}
+        >
+          {refreshing ? 'โหลด…' : '↻ Refresh'}
+        </button>
+        <button className="bdv-btn bdv-btn--approval" onClick={() => { setShowApprovalDialog(true); setApprovalStatus(null); setApprovalEmail('') }} disabled={busy || saving}>
+          ✉ ส่งขออนุมัติ
+        </button>
+
+        {/* save message — right aligned */}
+        <div className="bdv-toolbar-spacer" />
+        {saveMsg === 'ok' && <span className="bdv-save-msg bdv-save-msg--ok">✓ บันทึกแล้ว</span>}
+        {saveMsg === 'err' && <span className="bdv-save-msg bdv-save-msg--err">⚠ บันทึกไม่สำเร็จ</span>}
       </div>
-      <div className="bdv-scroll">
+
+      {/* ── Approval dialog ── */}
+      {showApprovalDialog && (
+        <div className="bdv-overlay" onClick={() => setShowApprovalDialog(false)}>
+          <div className="bdv-dialog" onClick={e => e.stopPropagation()}>
+            <div className="bdv-dialog-title">✉️ ส่ง Link ขออนุมัติ</div>
+            <div className="bdv-dialog-sub">ระบบจะส่ง email พร้อม link ให้ผู้รับกรอกชื่อใน Approved by</div>
+            {approvalStatus === 'ok'
+              ? <div className="bdv-dialog-ok">✅ ส่ง email เรียบร้อยแล้ว</div>
+              : approvalStatus?.startsWith('err')
+                ? <div className="bdv-dialog-err">⚠️ ส่งไม่สำเร็จ<br/><span style={{fontSize:11,wordBreak:'break-all'}}>{approvalStatus.slice(4)}</span></div>
+                : <>
+                    <label className="bdv-dialog-label">Email ผู้อนุมัติ</label>
+                    <input
+                      className="bdv-dialog-input"
+                      type="email"
+                      placeholder="approver@example.com"
+                      value={approvalEmail}
+                      onChange={e => setApprovalEmail(e.target.value)}
+                      onKeyDown={e => e.key === 'Enter' && sendApproval()}
+                      autoFocus
+                    />
+                  </>
+            }
+            <div className="bdv-dialog-actions">
+              <button className="bdv-btn" onClick={() => setShowApprovalDialog(false)}>ปิด</button>
+              {approvalStatus !== 'ok' && (
+                <button
+                  className="bdv-btn bdv-btn--approval"
+                  disabled={approvalStatus === 'sending' || !approvalEmail}
+                  onClick={sendApproval}
+                >
+                  {approvalStatus === 'sending' ? 'กำลังส่ง…' : 'ส่ง Email'}
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+      <div className={`bdv-scroll${blinking ? ' bdv-scroll--refreshing' : ''}`} onAnimationEnd={() => setBlinking(false)}>
         {pages.map((g, idx) => {
           const rows = [...g.rows]
           const need = Math.max(0, MIN_ROWS - rows.length)
@@ -333,6 +567,8 @@ export default function BomDocumentView({ bom, onRefresh }) {
                 header={header}
                 onToggle={onToggle}
                 onField={onField}
+                revNames={revNames}
+                setRevName={setRevName}
                 rows={rows}
                 pageNum={idx + 1}
                 totalPages={total}
@@ -365,27 +601,14 @@ export default function BomDocumentView({ bom, onRefresh }) {
    ├─ cols 17-20 supplier sub M/C T/T Local Import  (24 × 4)
    └─ cols 21-25 recie / code / kanban / lead / remark (26 30 30 28 36)
 ───────────────────────────────────────────────────────── */
-function BomPage({ bom, header, onToggle, onField, rows, pageNum, totalPages }) {
-  const revisions = bom.revisions?.length > 0
-    ? bom.revisions
-    : [{ mark: '–', revision_record: 'First issue', eci_no: bom.internal_eci_no, revision_date: bom.date }]
-
-  /* shared colgroup — identical in header table and BOM table */
-  function Cols() {
-    return (
-      <colgroup>
-        {[85,85,85,85,85].map((w,i)=><col key={`pn${i}`} style={{width:w}}/>)}
-        <col style={{width:160}}/><col style={{width:260}}/>
-        <col style={{width:30}}/><col style={{width:26}}/>
-        <col style={{width:26}}/><col style={{width:54}}/>
-        {[26,26,26,26,26].map((w,i)=><col key={`mc${i}`} style={{width:w}}/>)}
-        {[24,24,24,24].map((w,i)=><col key={`sp${i}`} style={{width:w}}/>)}
-        <col style={{width:26}}/><col style={{width:30}}/>
-        <col style={{width:30}}/><col style={{width:28}}/>
-        <col style={{width:36}}/>
-      </colgroup>
-    )
-  }
+function BomPage({ bom, header, onToggle, onField, revNames, setRevName, rows, pageNum, totalPages }) {
+  const pageLv1 = rows.find(r => r && r.level === 1)
+  const pageTgPartNo = pageLv1?.tg_part_no ?? bom.tg_part_no
+  const rawRevs = bom.revisions ?? []
+  const hasFirstIssue = rawRevs.some(r => !r.mark || r.mark === '–' || r.mark === '-')
+  const revisions = hasFirstIssue
+    ? rawRevs
+    : [{ mark: '–', revision_record: 'First issue', eci_no: bom.internal_eci_no, revision_date: bom.date }, ...rawRevs]
 
   return (
     <div className="bp">
@@ -500,19 +723,25 @@ function BomPage({ bom, header, onToggle, onField, rows, pageNum, totalPages }) 
               <b>
                 {(bom.tgt_history ?? []).map((h,i)=>(
                   <span key={i} style={{marginRight:2}}>
-                    {h.introduced_at > 0 && <span className="bp-tri-hdr">△{h.introduced_at}</span>}
+                    {h.introduced_at > 0 && <TriangleMark num={h.introduced_at} size="sm" />}
                     <span className="bp-pn-struck">{h.old_tg_part_no}</span>{' '}
                   </span>
                 ))}
-                {(bom.tgt_update_level ?? 0) > 0 && <span className="bp-tri-hdr">△{bom.tgt_update_level}</span>}
-                {bom.tg_part_no}
+                {(bom.tgt_update_level ?? 0) > 0 && <TriangleMark num={bom.tgt_update_level} size="sm" />}
+                {pageTgPartNo}
               </b>
             </td>
             <td className="bp-lbl" colSpan={1} rowSpan={2} style={{textAlign: 'center'}}>
               Customer Name :
             </td>
             <td className="bp-val" colSpan={3} rowSpan={2} style={{textAlign: 'center'}}>
-              <b>{bom.customer_name ?? bom.customer}</b>
+              <input
+                className="bp-rev-input"
+                value={header.customer_name}
+                onChange={e => onField('customer_name', e.target.value)}
+                placeholder="Customer Name"
+                style={{width:'100%', textAlign:'center', fontWeight:700}}
+              />
             </td>
             <td className="bp-lbl" colSpan={1} rowSpan={2} style={{textAlign: 'center'}}>
               Date :
@@ -604,56 +833,67 @@ function BomPage({ bom, header, onToggle, onField, rows, pageNum, totalPages }) 
       <table className="bp-bot-tbl">
         <Cols />
         <tbody>
-          {/* Row 1: Note (no rowSpan — fits content) + revision headers */}
-          <tr>
-            <td className="bp-note-cell" colSpan={6}>
-              <div style={{fontWeight:700,marginBottom:2}}>Note :</div>
-              <div className="bp-note-line">- First issue</div>
-              <div className="bp-note-line">'A' = Record by Engineering section&nbsp;&nbsp;Update ECI No.</div>
-              <div className="bp-note-line">'B' = Record by Part Control section</div>
-              <div className="bp-note-line">'C' = Record by Purchase section</div>
-            </td>
-            <td className="bp-rev-th" colSpan={1}>Mark</td>
-            <td className="bp-rev-th" colSpan={10}>Revision record</td>
-            <td className="bp-rev-th" colSpan={2}>ECI No.</td>
-            <td className="bp-rev-th" colSpan={2}>Date</td>
-            <td className="bp-rev-th" colSpan={2}>Revisioner</td>
-            <td className="bp-rev-th" colSpan={2}>Approved</td>
-          </tr>
-          {/* Revision data rows — cols 1-6 are invisible spacers */}
-          {revisions.map((rev,i)=>{
-            const isFirst = !rev.mark || rev.mark === '–' || rev.mark === '-'
-            return (
-              <tr key={i}>
-                <td colSpan={6} className="bp-bot-spacer"/>
-                <td className="bp-rev-td" colSpan={1} style={{textAlign:'center'}}>{isFirst ? '△' : `△${rev.mark}`}</td>
-                <td className="bp-rev-td" colSpan={10}>{rev.revision_record ?? ''}</td>
-                <td className="bp-rev-td" colSpan={2} style={{textAlign:'center'}}>{rev.eci_no ?? ''}</td>
-                <td className="bp-rev-td" colSpan={2} style={{textAlign:'center'}}>{rev.revision_date ?? ''}</td>
-                <td className="bp-rev-td" colSpan={2}>
-                  {isFirst
-                    ? <input className="bp-rev-input" value={header.revisioner} onChange={e=>onField('revisioner',e.target.value)} placeholder="ผู้แก้ไข"/>
-                    : rev.revisioner ?? ''}
+          {(()=>{
+            const emptyCount = Math.max(0, 6 - revisions.length)
+            const totalRows = 1 + revisions.length + emptyCount
+            return <>
+              {/* Note cell + spacer use rowSpan to sit flush next to revision header */}
+              <tr style={{height:'12px'}}>
+                <td className="bp-note-cell" colSpan={3} rowSpan={totalRows} style={{verticalAlign:'top'}}>
+                  <div style={{fontWeight:700,marginBottom:2}}>Note :</div>
+                  <div className="bp-note-line">'A' = Record by Engineering section&nbsp;&nbsp;Update ECI No.</div>
+                  <div className="bp-note-line">'B' = Record by Part Control section</div>
+                  <div className="bp-note-line">'C' = Record by Purchase section</div>
                 </td>
-                <td className="bp-rev-td" colSpan={2}>
-                  {isFirst
-                    ? <input className="bp-rev-input" value={header.approved_by} onChange={e=>onField('approved_by',e.target.value)} placeholder="ผู้อนุมัติ"/>
-                    : rev.approved_by ?? ''}
-                </td>
+                <td colSpan={3} className="bp-bot-spacer" rowSpan={totalRows}/>
+                <td className="bp-rev-th" colSpan={1}>Mark</td>
+                <td className="bp-rev-th" colSpan={10}>Revision record</td>
+                <td className="bp-rev-th" colSpan={2}>ECI No.</td>
+                <td className="bp-rev-th" colSpan={2}>Date</td>
+                <td className="bp-rev-th" colSpan={2}>Revisioner</td>
+                <td className="bp-rev-th" colSpan={2}>Approved</td>
               </tr>
-            )
-          })}
-          {Array(Math.max(0,5-revisions.length)).fill(null).map((_,i)=>(
-            <tr key={`e${i}`}>
-              <td colSpan={6} className="bp-bot-spacer"/>
-              <td className="bp-rev-td" colSpan={1}/>
-              <td className="bp-rev-td" colSpan={10}/>
-              <td className="bp-rev-td" colSpan={2}/>
-              <td className="bp-rev-td" colSpan={2}/>
-              <td className="bp-rev-td" colSpan={2}/>
-              <td className="bp-rev-td" colSpan={2}/>
-            </tr>
-          ))}
+              {revisions.map((rev,i)=>{
+                const isFirst = !rev.mark || rev.mark === '–' || rev.mark === '-'
+                return (
+                  <tr key={i} style={{height:'14px'}}>
+                    <td className="bp-rev-td" colSpan={1} style={{textAlign:'center'}}>
+                      {isFirst ? '' : <TriangleMark num={rev.mark} size="sm" />}
+                    </td>
+                    <td className="bp-rev-td" colSpan={10}>{rev.revision_record ?? ''}</td>
+                    <td className="bp-rev-td" colSpan={2} style={{textAlign:'center'}}>
+                      {rev.eci_no && bom.pdf_url
+                        ? <a href={bom.pdf_url} target="_blank" rel="noreferrer" style={{color:'inherit',textDecoration:'none',cursor:'pointer'}}>{rev.eci_no}</a>
+                        : (rev.eci_no ?? '')}
+                    </td>
+                    <td className="bp-rev-td" colSpan={2} style={{textAlign:'center'}}>{rev.revision_date ?? ''}</td>
+                    <td className="bp-rev-td" colSpan={2}>
+                      {isFirst
+                        ? <input className="bp-rev-input" value={header.revisioner} onChange={e=>onField('revisioner',e.target.value)} placeholder="ผู้แก้ไข"/>
+                        : <input className="bp-rev-input" value={revNames?.[rev.mark]?.revisioner ?? ''} onChange={e=>setRevName(rev.mark,'revisioner',e.target.value)} placeholder="ผู้แก้ไข"/>
+                      }
+                    </td>
+                    <td className="bp-rev-td" colSpan={2}>
+                      {isFirst
+                        ? <input className="bp-rev-input" value={header.approved_by} onChange={e=>onField('approved_by',e.target.value)} placeholder="ผู้อนุมัติ"/>
+                        : <input className="bp-rev-input" value={revNames?.[rev.mark]?.approved_by ?? ''} onChange={e=>setRevName(rev.mark,'approved_by',e.target.value)} placeholder="ผู้อนุมัติ"/>
+                      }
+                    </td>
+                  </tr>
+                )
+              })}
+              {Array(emptyCount).fill(null).map((_,i)=>(
+                <tr key={`e${i}`} style={{height:'14px'}}>
+                  <td className="bp-rev-td" colSpan={1}/>
+                  <td className="bp-rev-td" colSpan={10}/>
+                  <td className="bp-rev-td" colSpan={2}/>
+                  <td className="bp-rev-td" colSpan={2}/>
+                  <td className="bp-rev-td" colSpan={2}/>
+                  <td className="bp-rev-td" colSpan={2}/>
+                </tr>
+              ))}
+            </>
+          })()}
           {/* Route row */}
           <tr>
             <td colSpan={6} className="bp-bot-spacer"/>
@@ -683,6 +923,26 @@ function BomPage({ bom, header, onToggle, onField, rows, pageNum, totalPages }) 
       <div className="bp-footer">FM-PE30/SSE-007 Rev.01 (14/OCT/14) Approved SSE</div>
 
     </div>
+  )
+}
+
+/* ── revision mark triangle (△2, △3 …) ── */
+/* size='lg' = revision table (22px fixed)  |  size='sm' = inline with part no. (1em, won't expand row) */
+function TriangleMark({ num, size = 'lg' }) {
+  if (size === 'sm') {
+    return (
+      <svg height="1em" viewBox="0 0 22 20"
+           style={{display:'inline-block', verticalAlign:'middle', width:'1.1em', flexShrink:0, marginRight:2}}>
+        <polygon points="11,1.5 21,18.5 1,18.5" fill="white" stroke="#cc0000" strokeWidth="2.5"/>
+        <text x="11" y="16" textAnchor="middle" fontSize="9" fontWeight="bold" fill="#cc0000" fontFamily="Arial,sans-serif">{num}</text>
+      </svg>
+    )
+  }
+  return (
+    <svg width="22" height="20" viewBox="0 0 22 20" style={{display:'inline-block',verticalAlign:'middle',flexShrink:0}}>
+      <polygon points="11,1.5 21,18.5 1,18.5" fill="white" stroke="#cc0000" strokeWidth="2"/>
+      <text x="11" y="16" textAnchor="middle" fontSize="9" fontWeight="bold" fill="#cc0000" fontFamily="Arial,sans-serif">{num}</text>
+    </svg>
   )
 }
 
@@ -717,38 +977,74 @@ function BomRow({ row }) {
     row.material_standards && row.material_standards !== 'NO' ? row.material_standards : null,
   ].filter(Boolean).join('  ')
 
+  const hasCustPn = lv === 1 && !!row.customer_part_no
+  const trClass = `bp-row bp-row-lv${lv}${isRevisedOut ? ' bp-row-revised-out' : ''}`
+
   return (
-    <tr className={`bp-row bp-row-lv${lv}${isRevisedOut ? ' bp-row-revised-out' : ''}`}>
-      {[1, 2, 3, 4, 5].map(n => (
-        <td key={n} className={`bp-td bp-td-pn bp-td-pn${n}`}>
-          {n === lv ? (
-            <div className="bp-pn-cell">
-              <div className="bp-pn-line">
-                {displayLevel > 0 && <span className="bp-tri-mark">△{displayLevel}</span>}
-                <span>{row.tg_part_no ?? ''}</span>
-              </div>
-            </div>
-          ) : ''}
-        </td>
-      ))}
-      <td className="bp-td bp-td-name">{row.part_name}</td>
-      <td className="bp-td bp-td-spec">{spec}</td>
-      <td className="bp-td bp-td-c">{row.quantity != null ? Math.round(row.quantity) : ''}</td>
-      <td className="bp-td bp-td-c">{row.mass_g != null ? Number(row.mass_g).toLocaleString() : ''}</td>
-      <td className="bp-td bp-td-c" /><td className="bp-td bp-td-c" />
-      {[0, 1, 2, 3, 4].map(i => <td key={i} className="bp-td bp-td-c" />)}
-      {[0, 1, 2, 3].map(i => <td key={i} className="bp-td bp-td-c" />)}
-      <td className="bp-td bp-td-c" />
-      <td className="bp-td bp-td-c" />
-      <td className="bp-td bp-td-c" />
-      <td className="bp-td bp-td-c" />
-      <td className="bp-td bp-td-remark" />
-    </tr>
+    <>
+      <tr className={trClass}>
+        {[1, 2, 3, 4, 5].map(n => (
+          <td key={n} className={`bp-td bp-td-pn bp-td-pn${n}`}>
+            {n === lv ? (
+              hasCustPn
+                ? <div className="bp-pn-cell"><span>{row.customer_part_no}</span></div>
+                : <div className="bp-pn-cell">
+                    <div className="bp-pn-line">
+                      {displayLevel > 0 && <TriangleMark num={displayLevel} size="sm" />}
+                      <span>{row.tg_part_no ?? ''}</span>
+                    </div>
+                  </div>
+            ) : ''}
+          </td>
+        ))}
+        <td className="bp-td bp-td-name">{row.part_name}</td>
+        <td className="bp-td bp-td-spec">{spec}</td>
+        <td className="bp-td bp-td-c">{row.quantity != null ? Math.round(row.quantity) : ''}</td>
+        <td className="bp-td bp-td-c">{row.mass_g != null ? Number(row.mass_g).toLocaleString() : ''}</td>
+        <td className="bp-td bp-td-c" /><td className="bp-td bp-td-c" />
+        {[0,1,2,3,4].map(i => <td key={i} className="bp-td bp-td-c" />)}
+        {[0,1,2,3].map(i => <td key={i} className="bp-td bp-td-c" />)}
+        <td className="bp-td bp-td-c" />
+        <td className="bp-td bp-td-c" />
+        <td className="bp-td bp-td-c" />
+        <td className="bp-td bp-td-c" />
+        <td className="bp-td bp-td-remark" />
+      </tr>
+      {hasCustPn && (
+        <tr className={trClass}>
+          {[1, 2, 3, 4, 5].map(n => (
+            <td key={n} className={`bp-td bp-td-pn bp-td-pn${n}`}>
+              {n === 1
+                ? <div className="bp-pn-cell">
+                    <div className="bp-pn-line">
+                      {displayLevel > 0 && <TriangleMark num={displayLevel} size="sm" />}
+                      <span>{row.tg_part_no ?? ''}</span>
+                    </div>
+                  </div>
+                : ''}
+            </td>
+          ))}
+          <td className="bp-td bp-td-name">{row.part_name}</td>
+          <td className="bp-td bp-td-spec">{spec}</td>
+          <td className="bp-td bp-td-c">{row.quantity != null ? Math.round(row.quantity) : ''}</td>
+          <td className="bp-td bp-td-c">{row.mass_g != null ? Number(row.mass_g).toLocaleString() : ''}</td>
+          <td className="bp-td bp-td-c" /><td className="bp-td bp-td-c" />
+          {[0,1,2,3,4].map(i => <td key={i} className="bp-td bp-td-c" />)}
+          {[0,1,2,3].map(i => <td key={i} className="bp-td bp-td-c" />)}
+          <td className="bp-td bp-td-c" />
+          <td className="bp-td bp-td-c" />
+          <td className="bp-td bp-td-c" />
+          <td className="bp-td bp-td-c" />
+          <td className="bp-td bp-td-remark" />
+        </tr>
+      )}
+    </>
   )
 }
 
 /* ── Revision / Update dialog ── */
 function RevisionDialog({ bom, onClose, onDone }) {
+  const [mode, setMode] = useState('choose') // 'choose' | 'pdf' | 'manual'
   const [eciNo, setEciNo] = useState('')
   const [revDate, setRevDate] = useState(new Date().toISOString().split('T')[0])
   const [revisioner, setRevisioner] = useState('')
@@ -758,7 +1054,36 @@ function RevisionDialog({ bom, onClose, onDone }) {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState(null)
 
+  // PDF preview state
+  const [pdfParsing, setPdfParsing] = useState(false)
+  const [preview, setPreview] = useState(null) // { tgt_change, item_changes, new_items, header }
+  const [pdfError, setPdfError] = useState(null)
+  const fileRef = useRef(null)
+
   const allItems = (bom.items ?? []).filter(it => it.tg_part_no)
+
+  async function onPdfFile(file) {
+    if (!file?.name.toLowerCase().endsWith('.pdf')) {
+      setPdfError('กรุณาเลือกไฟล์ PDF เท่านั้น'); return
+    }
+    setPdfParsing(true); setPdfError(null); setPreview(null)
+    try {
+      const fd = new FormData(); fd.append('file', file)
+      const r = await fetch(`/api/import/revision-preview/${bom.id}`, { method: 'POST', body: fd })
+      const data = await r.json()
+      if (!r.ok) throw new Error(data.error)
+      setPreview(data)
+      if (data.header?.internal_eci_no) setEciNo(data.header.internal_eci_no)
+      if (data.tgt_change) setNewTgt(data.tgt_change.new)
+      // Pre-fill item_changes into itemUpdates
+      const updates = {}
+      for (const ch of data.item_changes ?? []) {
+        updates[ch.bom_id] = ch.new_pn
+      }
+      setItemUpdates(updates)
+    } catch (e) { setPdfError(e.message) }
+    finally { setPdfParsing(false) }
+  }
 
   function onItemChange(id, val) {
     setItemUpdates(prev => ({ ...prev, [id]: val }))
@@ -770,12 +1095,10 @@ function RevisionDialog({ bom, onClose, onDone }) {
       .map(([bom_id, new_part_no]) => ({ bom_id: parseInt(bom_id), new_part_no: new_part_no.trim() }))
 
     if (!items.length && !newTgt.trim()) {
-      setError('ไม่มีการเปลี่ยนแปลงใดๆ')
-      return
+      setError('ไม่มีการเปลี่ยนแปลงใดๆ'); return
     }
 
-    setSaving(true)
-    setError(null)
+    setSaving(true); setError(null)
     try {
       const r = await fetch(`/api/bom/${bom.id}/revision`, {
         method: 'POST',
@@ -806,49 +1129,166 @@ function RevisionDialog({ bom, onClose, onDone }) {
           <button className="rev-dlg__close" onClick={onClose}>✕</button>
         </div>
         <div className="rev-dlg__body">
-          <div className="rev-dlg__grid">
-            <label>ECI No.</label>
-            <input value={eciNo} onChange={e => setEciNo(e.target.value)} placeholder="26A376" />
-            <label>Date</label>
-            <input type="date" value={revDate} onChange={e => setRevDate(e.target.value)} />
-            <label>Revisioner</label>
-            <input value={revisioner} onChange={e => setRevisioner(e.target.value)} />
-            <label>Approved</label>
-            <input value={approvedBy} onChange={e => setApprovedBy(e.target.value)} />
-            <label>TGT Part No. ใหม่</label>
-            <input value={newTgt} onChange={e => setNewTgt(e.target.value)} placeholder={bom.tg_part_no ?? ''} />
-          </div>
 
-          <div className="rev-dlg__section-title">
-            Part No. ที่เปลี่ยน — ระบุค่าใหม่เฉพาะรายการที่เปลี่ยน (เว้นว่างถ้าไม่เปลี่ยน)
-          </div>
-          <div className="rev-dlg__items">
-            <div className="rev-dlg__items-hdr">
-              <span>Lv</span><span>Part No. ปัจจุบัน</span><span>Part Name</span><span>Part No. ใหม่</span>
+          {/* ── Mode chooser ── */}
+          {mode === 'choose' && (
+            <div className="rev-dlg__choose">
+              <button className="rev-dlg__choose-btn" onClick={() => setMode('pdf')}>
+                <span className="rev-dlg__choose-icon">📄</span>
+                <span className="rev-dlg__choose-title">อัพโหลด PDF ใหม่</span>
+                <span className="rev-dlg__choose-sub">ระบบเปรียบเทียบ Part No. ให้อัตโนมัติ</span>
+              </button>
+              <button className="rev-dlg__choose-btn" onClick={() => setMode('manual')}>
+                <span className="rev-dlg__choose-icon">✏️</span>
+                <span className="rev-dlg__choose-title">กรอกเอง</span>
+                <span className="rev-dlg__choose-sub">ระบุ Part No. ที่เปลี่ยนด้วยตนเอง</span>
+              </button>
             </div>
-            {allItems.map(item => (
-              <div key={item.id} className="rev-dlg__item-row">
-                <span className="rev-dlg__lv">{item.level}</span>
-                <span className="rev-dlg__cur-pn">{item.tg_part_no}</span>
-                <span className="rev-dlg__name">{item.part_name}</span>
-                <input
-                  className="rev-dlg__new-pn"
-                  placeholder="ใส่ค่าใหม่…"
-                  value={itemUpdates[item.id] ?? ''}
-                  onChange={e => onItemChange(item.id, e.target.value)}
-                />
+          )}
+
+          {/* ── PDF mode ── */}
+          {mode === 'pdf' && (
+            <>
+              <button className="rev-dlg__back" onClick={() => { setMode('choose'); setPreview(null); setPdfError(null) }}>← กลับ</button>
+
+              {!preview && (
+                <div
+                  className={`rev-dlg__dropzone${pdfParsing ? ' rev-dlg__dropzone--loading' : ''}`}
+                  onClick={() => !pdfParsing && fileRef.current?.click()}
+                  onDrop={e => { e.preventDefault(); onPdfFile(e.dataTransfer.files[0]) }}
+                  onDragOver={e => e.preventDefault()}
+                >
+                  <input ref={fileRef} type="file" accept=".pdf" style={{display:'none'}} onChange={e => onPdfFile(e.target.files[0])} />
+                  {pdfParsing
+                    ? <><div className="upload-spinner" style={{margin:'0 auto 8px'}}/><div>กำลังวิเคราะห์ PDF… (30–60 วินาที)</div></>
+                    : <><div style={{fontSize:28}}>📄</div><div style={{marginTop:6,fontWeight:500}}>เลือกหรือลาก PDF ไฟล์ใหม่มาวางที่นี่</div></>
+                  }
+                </div>
+              )}
+              {pdfError && <div className="rev-dlg__error">⚠ {pdfError}</div>}
+
+              {/* Preview results */}
+              {preview && (
+                <>
+                  <div className="rev-dlg__preview-title">ผลการเปรียบเทียบ</div>
+
+                  {!preview.tgt_change && !preview.item_changes?.length && !preview.new_items?.length && (
+                    <div className="rev-dlg__preview-none">ไม่พบการเปลี่ยนแปลง Part No. ใดๆ</div>
+                  )}
+
+                  {preview.tgt_change && (
+                    <div className="rev-dlg__preview-section">
+                      <div className="rev-dlg__preview-label">TGT Part No.</div>
+                      <div className="rev-dlg__diff-row">
+                        <span className="rev-dlg__diff-old">{preview.tgt_change.old}</span>
+                        <span className="rev-dlg__diff-arrow">→</span>
+                        <span className="rev-dlg__diff-new">{preview.tgt_change.new}</span>
+                      </div>
+                    </div>
+                  )}
+
+                  {preview.item_changes?.length > 0 && (
+                    <div className="rev-dlg__preview-section">
+                      <div className="rev-dlg__preview-label">Part No. ที่เปลี่ยน ({preview.item_changes.length} รายการ)</div>
+                      {preview.item_changes.map((ch, i) => (
+                        <div key={i} className="rev-dlg__diff-row">
+                          <span className="rev-dlg__diff-lv">Lv{ch.level}</span>
+                          <span className="rev-dlg__diff-old">{ch.old_pn}</span>
+                          <span className="rev-dlg__diff-arrow">→</span>
+                          <span className="rev-dlg__diff-new">{ch.new_pn}</span>
+                          <span className="rev-dlg__diff-name">{ch.part_name}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {preview.new_items?.length > 0 && (
+                    <div className="rev-dlg__preview-section">
+                      <div className="rev-dlg__preview-label">Part ใหม่ที่จะเพิ่ม ({preview.new_items.length} รายการ)</div>
+                      {preview.new_items.map((it, i) => (
+                        <div key={i} className="rev-dlg__diff-row">
+                          <span className="rev-dlg__diff-lv">Lv{it.level}</span>
+                          <span className="rev-dlg__diff-new">{it.tg_part_no}</span>
+                          <span className="rev-dlg__diff-name">{it.part_name}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Meta fields */}
+                  <div className="rev-dlg__preview-label" style={{marginTop:14}}>ข้อมูล Revision</div>
+                  <div className="rev-dlg__grid">
+                    <label>ECI No.</label>
+                    <input value={eciNo} onChange={e => setEciNo(e.target.value)} placeholder="26A376" />
+                    <label>Date</label>
+                    <input type="date" value={revDate} onChange={e => setRevDate(e.target.value)} />
+                    <label>Revisioner</label>
+                    <input value={revisioner} onChange={e => setRevisioner(e.target.value)} />
+                    <label>Approved</label>
+                    <input value={approvedBy} onChange={e => setApprovedBy(e.target.value)} />
+                  </div>
+
+                  {error && <div className="rev-dlg__error">⚠ {error}</div>}
+                  <div className="rev-dlg__footer">
+                    <button className="bdv-btn bdv-btn--secondary" onClick={() => { setPreview(null); setPdfError(null) }} disabled={saving}>อัพโหลดใหม่</button>
+                    <button className="bdv-btn" onClick={submit} disabled={saving || (!preview.tgt_change && !preview.item_changes?.length)}>
+                      {saving ? 'กำลังบันทึก…' : '✓ ยืนยัน Update'}
+                    </button>
+                  </div>
+                </>
+              )}
+            </>
+          )}
+
+          {/* ── Manual mode ── */}
+          {mode === 'manual' && (
+            <>
+              <button className="rev-dlg__back" onClick={() => setMode('choose')}>← กลับ</button>
+              <div className="rev-dlg__grid">
+                <label>ECI No.</label>
+                <input value={eciNo} onChange={e => setEciNo(e.target.value)} placeholder="26A376" />
+                <label>Date</label>
+                <input type="date" value={revDate} onChange={e => setRevDate(e.target.value)} />
+                <label>Revisioner</label>
+                <input value={revisioner} onChange={e => setRevisioner(e.target.value)} />
+                <label>Approved</label>
+                <input value={approvedBy} onChange={e => setApprovedBy(e.target.value)} />
+                <label>TGT Part No. ใหม่</label>
+                <input value={newTgt} onChange={e => setNewTgt(e.target.value)} placeholder={bom.tg_part_no ?? ''} />
               </div>
-            ))}
-          </div>
 
-          {error && <div className="rev-dlg__error">⚠ {error}</div>}
+              <div className="rev-dlg__section-title">
+                Part No. ที่เปลี่ยน — ระบุค่าใหม่เฉพาะรายการที่เปลี่ยน (เว้นว่างถ้าไม่เปลี่ยน)
+              </div>
+              <div className="rev-dlg__items">
+                <div className="rev-dlg__items-hdr">
+                  <span>Lv</span><span>Part No. ปัจจุบัน</span><span>Part Name</span><span>Part No. ใหม่</span>
+                </div>
+                {allItems.map(item => (
+                  <div key={item.id} className="rev-dlg__item-row">
+                    <span className="rev-dlg__lv">{item.level}</span>
+                    <span className="rev-dlg__cur-pn">{item.tg_part_no}</span>
+                    <span className="rev-dlg__name">{item.part_name}</span>
+                    <input
+                      className="rev-dlg__new-pn"
+                      placeholder="ใส่ค่าใหม่…"
+                      value={itemUpdates[item.id] ?? ''}
+                      onChange={e => onItemChange(item.id, e.target.value)}
+                    />
+                  </div>
+                ))}
+              </div>
 
-          <div className="rev-dlg__footer">
-            <button className="bdv-btn bdv-btn--secondary" onClick={onClose} disabled={saving}>ยกเลิก</button>
-            <button className="bdv-btn" onClick={submit} disabled={saving}>
-              {saving ? 'กำลังบันทึก…' : 'บันทึก Update'}
-            </button>
-          </div>
+              {error && <div className="rev-dlg__error">⚠ {error}</div>}
+              <div className="rev-dlg__footer">
+                <button className="bdv-btn bdv-btn--secondary" onClick={onClose} disabled={saving}>ยกเลิก</button>
+                <button className="bdv-btn" onClick={submit} disabled={saving}>
+                  {saving ? 'กำลังบันทึก…' : 'บันทึก Update'}
+                </button>
+              </div>
+            </>
+          )}
+
         </div>
       </div>
     </div>

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Set-Location d:\\\\bom; $psi = New-Object System.Diagnostics.ProcessStartInfo; $psi.FileName = \"node_modules\\\\electron\\\\dist\\\\electron.exe\"; $psi.Arguments = \".\"; $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.WorkingDirectory = \"d:\\\\bom\"; $p = [System.Diagnostics.Process]::Start\\($psi\\); Start-Sleep -Seconds 20; $err = $p.StandardError.ReadToEnd\\(\\); $out = $p.StandardOutput.ReadToEnd\\(\\); if \\(!$p.HasExited\\) { Write-Host \"SUCCESS — app is still running\"; $p.Kill\\(\\) } else { Write-Host \"Exited: $\\($p.ExitCode\\)\" }; if \\($err\\) { Write-Host \"ERR: $err }; if \\($out\\) { Write-Host \"OUT: $out })",
+      "Bash(node --input-type=module)",
+      "Bash(node --input-type=module -e \"import { PDFParse } from 'pdf-parse'; console.log\\('OK:', typeof PDFParse\\)\")",
+      "PowerShell(pm2 logs bom --lines 30 --nostream 2>&1)"
+    ]
+  }
+}

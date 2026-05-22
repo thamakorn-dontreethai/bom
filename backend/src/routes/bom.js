@@ -1,7 +1,19 @@
 import express from 'express'
+import multer from 'multer'
+import path from 'path'
+import { fileURLToPath } from 'url'
 import { pool } from '../db.js'
 
 const router = express.Router()
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: path.join(__dirname, '../../uploads/parts'),
+    filename: (_req, file, cb) => cb(null, `${Date.now()}-${file.originalname}`),
+  }),
+  limits: { fileSize: 10 * 1024 * 1024 },
+})
 
 const HEADER_SELECT = `
   SELECT
@@ -14,7 +26,7 @@ const HEADER_SELECT = `
     ds.reg_certif,
     to_char(ds.effective_date, 'DD-Mon-YY')       AS date,
     c.customer_code                               AS customer,
-    c.customer_name,
+    COALESCE(ds.customer_name_override, c.customer_name) AS customer_name,
     ds.tg_part_no,
     ds.customer_standard                          AS customer_standards,
     ds.tg_standard                                AS tg_standards,
@@ -24,7 +36,16 @@ const HEADER_SELECT = `
     ds.checked_by,
     ds.approved_by,
     ds.confirmed_by,
-    'WHEEL ASSY, STEERING (N)'                    AS part_name
+    ds.pdf_url,
+    'WHEEL ASSY, STEERING (N)'                    AS part_name,
+    COALESCE(ds.evt_first_issue, FALSE)           AS evt_first_issue,
+    COALESCE(ds.evt_cv, FALSE)                    AS evt_cv,
+    COALESCE(ds.evt_mq, FALSE)                    AS evt_mq,
+    COALESCE(ds.evt_dan, FALSE)                   AS evt_dan,
+    COALESCE(ds.evt_hin, FALSE)                   AS evt_hin,
+    COALESCE(ds.evt_sop, FALSE)                   AS evt_sop,
+    COALESCE(ds.concern_drawing, FALSE)           AS concern_drawing,
+    COALESCE(ds.concern_actual_part, FALSE)       AS concern_actual_part
   FROM tg.design_spec ds
   JOIN tg.model    m ON m.model_id    = ds.model_id
   JOIN tg.customer c ON c.customer_id = ds.customer_id
@@ -71,7 +92,8 @@ const ITEMS_SQL = `
     COALESCE(it.bom_notes, p.notes)                           AS note,
     it.sort_order,
     it.update_level,
-    it.status
+    it.status,
+    p.image_url
   FROM it
   JOIN tg.part p ON it.child_part_id = p.part_id
   LEFT JOIN LATERAL (
@@ -95,12 +117,11 @@ router.patch('/:id/header', async (req, res) => {
   const b   = req.body
   const dsId = parseInt(req.params.id)
   try {
-    // prepared_by / approved_by always exist
     await pool.query(
       `UPDATE tg.design_spec
-       SET prepared_by = $1, approved_by = $2
-       WHERE design_spec_id = $3`,
-      [b.revisioner ?? null, b.approved_by ?? null, dsId]
+       SET prepared_by = $1, approved_by = $2, customer_name_override = $3
+       WHERE design_spec_id = $4`,
+      [b.revisioner ?? null, b.approved_by ?? null, b.customer_name ?? null, dsId]
     )
     // evt_* and concern_* columns added by migration_001 — skip if not yet migrated
     try {
@@ -121,6 +142,17 @@ router.patch('/:id/header', async (req, res) => {
          dsId]
       )
     } catch (_) { /* migration_001 not yet applied — silently skip */ }
+
+    // update revisioner/approved_by for non-first revision rows
+    if (Array.isArray(b.rev_names) && b.rev_names.length) {
+      for (const u of b.rev_names) {
+        await pool.query(
+          `UPDATE tg.bom_revision SET revisioner=$1, approved_by=$2
+           WHERE design_spec_id=$3 AND mark=$4`,
+          [u.revisioner ?? null, u.approved_by ?? null, dsId, u.mark]
+        )
+      }
+    }
 
     res.json({ saved: true })
   } catch (e) {
@@ -245,7 +277,9 @@ router.post('/:id/revision', async (req, res) => {
        FROM tg.bom_revision WHERE design_spec_id = $1`,
       [dsId]
     )
-    const newLevel = (lvRows[0].max_level ?? 0) + 1
+    const maxLevel = lvRows[0].max_level ?? 0
+    // First issue counts as "1", so first real update = △2
+    const newLevel = maxLevel === 0 ? 2 : maxLevel + 1
 
     // Process each changed item
     for (const { bom_id, new_part_no } of items) {
@@ -422,6 +456,99 @@ router.post('/:id/items', async (req, res) => {
   }
 })
 
+// POST /api/bom/:id/items/insert-after  (multipart: after_bom_id, part_name, tg_part_no, notes, quantity, mass_gram + optional image)
+router.post('/:id/items/insert-after', upload.single('image'), async (req, res) => {
+  const dsId = parseInt(req.params.id)
+  const { after_bom_id, part_name, tg_part_no, notes, quantity, mass_gram } = req.body
+  if (!part_name) return res.status(400).json({ error: 'part_name required' })
+
+  // Accept free-form text; store non-numeric values in notes rather than crashing
+  const qtyNum = parseFloat(quantity)
+  const massNum = parseFloat(mass_gram)
+  const qtyVal = isNaN(qtyNum) ? null : qtyNum
+  const massVal = isNaN(massNum) ? null : massNum
+  const extraParts = [
+    notes || null,
+    (!isNaN(qtyNum) || !quantity) ? null : `Q'ty: ${quantity}`,
+    (!isNaN(massNum) || !mass_gram) ? null : `Weight: ${mass_gram}`,
+  ].filter(Boolean)
+  const combinedNotes = extraParts.length ? extraParts.join(' | ') : null
+
+  const imageUrl = req.file ? `/uploads/parts/${req.file.filename}` : null
+
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+
+    // Get the selected item
+    const { rows: selRows } = await client.query(
+      `SELECT bom_id, bom_level, sort_order, child_part_id, parent_part_id, variant_id
+       FROM tg.bom WHERE bom_id = $1 AND design_spec_id = $2`,
+      [after_bom_id, dsId]
+    )
+    if (!selRows.length) throw new Error('Reference item not found')
+    const sel = selRows[0]
+
+    // Level: go one deeper, max 5. At level 5 → sibling (same level, same parent)
+    const newLevel = Math.min(sel.bom_level + 1, 5)
+    const newParentPartId = newLevel === sel.bom_level + 1
+      ? sel.child_part_id      // child of selected
+      : sel.parent_part_id     // sibling (level 5 case)
+
+    const newSortOrder = parseInt(sel.sort_order) + 1
+
+    // Shift all items that come after to make room
+    await client.query(
+      `UPDATE tg.bom SET sort_order = sort_order + 1
+       WHERE design_spec_id = $1 AND sort_order >= $2`,
+      [dsId, newSortOrder]
+    )
+
+    // Insert part
+    let partId
+    if (tg_part_no) {
+      const { rows: ex } = await client.query(
+        'SELECT part_id FROM tg.part WHERE tg_part_no = $1', [tg_part_no]
+      )
+      if (ex.length) {
+        partId = ex[0].part_id
+        if (imageUrl) await client.query('UPDATE tg.part SET image_url=$1 WHERE part_id=$2', [imageUrl, partId])
+      } else {
+        const { rows } = await client.query(
+          `INSERT INTO tg.part (tg_part_no, part_name, mass_gram, notes, image_url)
+           VALUES ($1,$2,$3,$4,$5) RETURNING part_id`,
+          [tg_part_no, part_name, massVal, combinedNotes, imageUrl]
+        )
+        partId = rows[0].part_id
+      }
+    } else {
+      const { rows } = await client.query(
+        `INSERT INTO tg.part (part_name, mass_gram, notes, image_url)
+         VALUES ($1,$2,$3,$4) RETURNING part_id`,
+        [part_name, massVal, combinedNotes, imageUrl]
+      )
+      partId = rows[0].part_id
+    }
+
+    // Insert BOM row
+    const { rows: bomRow } = await client.query(
+      `INSERT INTO tg.bom
+         (design_spec_id, variant_id, parent_part_id, child_part_id,
+          bom_level, quantity, sort_order, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'active') RETURNING bom_id`,
+      [dsId, sel.variant_id, newParentPartId, partId, newLevel, qtyVal ?? 1, newSortOrder]
+    )
+
+    await client.query('COMMIT')
+    res.status(201).json({ bom_id: bomRow[0].bom_id, part_id: partId })
+  } catch (e) {
+    await client.query('ROLLBACK')
+    res.status(500).json({ error: e.message })
+  } finally {
+    client.release()
+  }
+})
+
 // PUT /api/bom/:id/items/:itemId
 router.put('/:id/items/:itemId', async (req, res) => {
   const b = req.body
@@ -460,6 +587,32 @@ router.delete('/:id/items/:itemId', async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message })
   }
+})
+
+// DELETE /api/bom/:id — ลบ BOM ทั้งหมด
+router.delete('/:id', async (req, res) => {
+  const dsId = parseInt(req.params.id)
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const { rows: boms } = await client.query('SELECT bom_id FROM tg.bom WHERE design_spec_id=$1', [dsId])
+    const bomIds = boms.map(r => r.bom_id)
+    if (bomIds.length) {
+      await client.query('DELETE FROM tg.approval_tokens WHERE bom_id = ANY($1)', [bomIds])
+      await client.query('DELETE FROM tg.bom_item_history WHERE bom_id = ANY($1)', [bomIds])
+    }
+    await client.query('DELETE FROM tg.bom_revision WHERE design_spec_id=$1', [dsId])
+    await client.query('DELETE FROM tg.design_spec_tgt_history WHERE design_spec_id=$1', [dsId])
+    await client.query('DELETE FROM tg.bom_document WHERE design_spec_id=$1', [dsId])
+    await client.query('DELETE FROM tg.bom WHERE design_spec_id=$1', [dsId])
+    await client.query('DELETE FROM tg.product_variant WHERE design_spec_id=$1', [dsId])
+    await client.query('DELETE FROM tg.design_spec WHERE design_spec_id=$1', [dsId])
+    await client.query('COMMIT')
+    res.json({ ok: true })
+  } catch (e) {
+    await client.query('ROLLBACK')
+    res.status(500).json({ error: e.message })
+  } finally { client.release() }
 })
 
 // DELETE /api/bom/:id/revisions/reset — ลบข้อมูล revision ทั้งหมดและ reset กลับสู่สภาพเริ่มต้น

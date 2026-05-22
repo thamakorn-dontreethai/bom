@@ -1,10 +1,17 @@
 import express from 'express'
 import multer from 'multer'
-import { createRequire } from 'module'
+import fs from 'fs'
+import path from 'path'
+import { fileURLToPath } from 'url'
+import { PDFParse } from 'pdf-parse'
+import { GoogleGenerativeAI } from '@google/generative-ai'
 import { pool } from '../db.js'
 
-const _require = createRequire(import.meta.url)
-const { PDFParse } = _require('pdf-parse')
+const genai = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '')
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const PDF_DIR = path.join(__dirname, '../../uploads/pdfs')
+if (!fs.existsSync(PDF_DIR)) fs.mkdirSync(PDF_DIR, { recursive: true })
 
 const router = express.Router()
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 30 * 1024 * 1024 } })
@@ -119,6 +126,7 @@ function parseBomItems(text) {
     // Part Name + Product Standards + Material Standards
     const nameParts = []
     let productStd = null, materialStd = null
+    let noteFromTab = null  // note text captured from after-tab on name line
 
     while (i < lines.length && nameParts.length < 4) {
       const nl = lines[i]
@@ -138,6 +146,7 @@ function parseBomItems(text) {
         if (bTab) nameParts.push(bTab)
         const sm = aTab.match(/^(IN DRAWING|NO\b|YES\b|N\/A)/i)
         if (sm) productStd = sm[1]
+        else if (aTab) noteFromTab = aTab  // e.g. "MATERIAL:Fe 6H SIDE TGT"
         i++; break
       }
       if (/^(IN DRAWING|NO|YES|N\/A)$/i.test(t) && nameParts.length > 0) { productStd = t; i++; break }
@@ -157,13 +166,20 @@ function parseBomItems(text) {
       if (mm) { materialStd = mm[1]; i++ }
     }
 
-    // Skip remaining content of this row (notes, material sub-rows)
+    // Capture note text + skip material sub-rows
+    const noteLines = noteFromTab ? [noteFromTab] : []
     while (i < lines.length) {
       if (/^\s*#/.test(lines[i])) { usePortion = true; i++; continue }
       if (isSkip(lines[i])) { i++; continue }
       if (ROW_START.test(lines[i])) break
+      const nt = lines[i].trim()
+      // Note: descriptive text line (no tab = not a code/data field, not pure number)
+      if (nt && !lines[i].includes('\t') && !/^\d+(\.\d+)?$/.test(nt) && noteLines.length < 2) {
+        noteLines.push(nt)
+      }
       i++
     }
+    const note = noteLines.length > 0 ? noteLines.join(' ').trim() : null
 
     if (tgPartNo || partName) {
       items.push({
@@ -173,12 +189,161 @@ function parseBomItems(text) {
         quantity, mass_g: massG,
         soc, rc, use_portion: usePortion,
         product_standards: productStd, material_standards: materialStd,
-        note: null, material_no: null, material_trade_name: null,
+        note, material_no: null, material_trade_name: null,
         color_no: null, color_tone: null, material_type: null, sa: null,
       })
     }
   }
   return items
+}
+
+const GEMINI_PROMPT = `
+You are extracting BOM (Bill of Materials) data from a Toyota Gosei "Design Specification Instruction" PDF.
+
+Return ONLY a JSON object with this exact structure (no markdown, no explanation):
+{
+  "header": {
+    "model": "3-char model code e.g. 3GJ",
+    "customer_part_no": "e.g. 78500-3DA-J110-M1",
+    "tg_part_no": "e.g. 78500-DA000-6***",
+    "production_level": "e.g. 3:SPECIAL ORDER",
+    "initial_stage": "e.g. C",
+    "reg_certif": "e.g. None",
+    "date": "e.g. 2026/02/02",
+    "customer_code": "4-digit code e.g. 6991",
+    "customer_standards": "e.g. IN DRAWING",
+    "tg_standards": "e.g. NO",
+    "internal_eci_no": "e.g. 26A376"
+  },
+  "items": [
+    {
+      "key": "variant key e.g. 1 or 1-6 or 1,3",
+      "level": 1,
+      "customer_part_no": "customer PN or null",
+      "tg_part_no": "TG PN e.g. GS110-88730-C",
+      "part_name": "part name text",
+      "level_code": "e.g. 1-2 or null",
+      "quantity": 1,
+      "mass_g": 1208,
+      "soc": null,
+      "rc": false,
+      "use_portion": false,
+      "product_standards": "IN DRAWING or NO or null",
+      "material_standards": "IN DRAWING or NO or null",
+      "note": null,
+      "material_no": null,
+      "material_trade_name": null,
+      "color_no": null,
+      "color_tone": null,
+      "material_type": null,
+      "sa": null
+    }
+  ]
+}
+
+Rules:
+- Extract ALL BOM rows (all pages), not just page 1
+- ">>>" prefix on a row means it is a revised/updated part
+- Key "1-6" means this part applies to all 6 variants; "1" means only variant 1
+- level is an integer 1-5
+- quantity and mass_g are numbers (null if unknown)
+- rc is true if the row has R/C or % marker
+- use_portion is true if there is a "#" sub-row indicating purchased material
+- Include sub-items (levels 2-5) under their parent
+- Part names may span multiple lines — join them
+- If a field is not present, use null
+`.trim()
+
+async function extractBomWithGemini(pdfBuffer) {
+  const model = genai.getGenerativeModel({ model: 'gemini-2.0-flash' })
+  const pdfBase64 = Buffer.from(pdfBuffer).toString('base64')
+  const result = await model.generateContent([
+    { inlineData: { mimeType: 'application/pdf', data: pdfBase64 } },
+    GEMINI_PROMPT,
+  ])
+  const raw = result.response.text().trim()
+  const json = raw.startsWith('```') ? raw.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '') : raw
+  const parsed = JSON.parse(json)
+  return { header: parsed.header, items: parsed.items ?? [] }
+}
+
+// ── OCR fallback (scanned PDFs) ──────────────────────────────────────────────
+
+async function ocrPdfToText(pdfBuffer) {
+  const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs')
+  const { createCanvas } = await import('@napi-rs/canvas')
+  const { createWorker } = await import('tesseract.js')
+  const tmpDir = path.join(__dirname, '../../uploads')
+
+  const doc = await pdfjs.getDocument({ data: new Uint8Array(pdfBuffer), verbosity: 0 }).promise
+  const worker = await createWorker('eng', 1, { logger: () => {} })
+  const texts = []
+
+  for (let p = 1; p <= doc.numPages; p++) {
+    const page = await doc.getPage(p)
+    const ops = await page.getOperatorList()
+
+    // Find largest image XObject on the page (the scanned page image)
+    let bestImg = null
+    for (let i = 0; i < ops.fnArray.length; i++) {
+      const fn = ops.fnArray[i]
+      if (fn !== pdfjs.OPS.paintImageXObject && fn !== pdfjs.OPS.paintInlineImageXObject) continue
+      const name = ops.argsArray[i][0]
+      const imgData = await new Promise(resolve => {
+        const isCommon = page.commonObjs.has(name)
+        ;(isCommon ? page.commonObjs : page.objs).get(name, resolve)
+      })
+      if (imgData && imgData.data && imgData.width * imgData.height > (bestImg?.width ?? 0) * (bestImg?.height ?? 0)) {
+        bestImg = imgData
+      }
+    }
+
+    if (bestImg) {
+      const { width, height, data, kind } = bestImg
+      const canvas = createCanvas(width, height)
+      const ctx = canvas.getContext('2d')
+      const imgDataObj = ctx.createImageData(width, height)
+      const dest = imgDataObj.data
+
+      if (kind === 2) { // RGB_24BPP
+        for (let px = 0; px < width * height; px++) {
+          dest[px * 4]     = data[px * 3]
+          dest[px * 4 + 1] = data[px * 3 + 1]
+          dest[px * 4 + 2] = data[px * 3 + 2]
+          dest[px * 4 + 3] = 255
+        }
+      } else if (kind === 1) { // GRAYSCALE_1BPP (bit-packed)
+        let px = 0
+        for (let b = 0; b < data.length && px < width * height; b++) {
+          for (let bit = 7; bit >= 0 && px < width * height; bit--, px++) {
+            const v = ((data[b] >> bit) & 1) ? 255 : 0
+            dest[px * 4] = dest[px * 4 + 1] = dest[px * 4 + 2] = v
+            dest[px * 4 + 3] = 255
+          }
+        }
+      } else { // RGBA or other — copy directly
+        for (let px = 0; px < width * height; px++) {
+          dest[px * 4]     = data[px * 4]     ?? 0
+          dest[px * 4 + 1] = data[px * 4 + 1] ?? 0
+          dest[px * 4 + 2] = data[px * 4 + 2] ?? 0
+          dest[px * 4 + 3] = data[px * 4 + 3] ?? 255
+        }
+      }
+
+      ctx.putImageData(imgDataObj, 0, 0)
+      const tmpFile = path.join(tmpDir, `_ocr_page_${p}.png`)
+      fs.writeFileSync(tmpFile, canvas.toBuffer('image/png'))
+      const { data: { text } } = await worker.recognize(tmpFile)
+      fs.unlinkSync(tmpFile)
+      texts.push(text)
+    }
+
+    page.cleanup()
+  }
+
+  await worker.terminate()
+  await doc.destroy()
+  return texts.join('\n\n-- page --\n\n')
 }
 
 async function extractBomFromPdf(pdfBuffer) {
@@ -187,10 +352,35 @@ async function extractBomFromPdf(pdfBuffer) {
   const text = result.text
   const header = parseHeader(text)
   const items = parseBomItems(text)
-  if (!header.internal_eci_no && !items.length) {
-    throw new Error('ไม่พบข้อมูล BOM ในไฟล์ PDF')
+
+  if (header.internal_eci_no || items.length) {
+    return { header, items }
   }
-  return { header, items }
+
+  // ── Fallback 1: OCR (for scanned PDFs) ──────────────────────────────────
+  const dumpPath = path.join(__dirname, '../../uploads/debug-text.txt')
+  fs.writeFileSync(dumpPath, text, 'utf8')
+  console.log('Text extraction empty — trying OCR...')
+  try {
+    const ocrText = await ocrPdfToText(pdfBuffer)
+    const ocrDump = dumpPath.replace('.txt', '-ocr.txt')
+    fs.writeFileSync(ocrDump, ocrText, 'utf8')
+    console.log('OCR complete — saved to', ocrDump)
+    const oh = parseHeader(ocrText)
+    const oi = parseBomItems(ocrText)
+    if (oh.internal_eci_no || oi.length) return { header: oh, items: oi }
+    console.log('OCR parser also found nothing — falling back to Gemini...')
+  } catch (e) {
+    console.error('OCR error:', e.message)
+  }
+
+  throw new Error('ไม่พบข้อมูล BOM ในไฟล์ PDF — OCR อ่านไม่ออก')
+}
+
+async function extractTextFromPdf(pdfBuffer) {
+  const parser = new PDFParse({ data: new Uint8Array(pdfBuffer) })
+  const result = await parser.getText()
+  return result.text
 }
 
 // ── Suffix-revision helpers ───────────────────────────────────────────────────
@@ -308,7 +498,7 @@ async function reconcileBomItems(client, dsId, newItems, partCache) {
           bom_level, level_code, quantity, sort_order, status)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active')`,
       [dsId, variantId, parentPartId, partId,
-       bomLevel, levelCode, item.quantity ?? 1, sortOrder]
+       bomLevel, levelCode, Math.round(item.quantity ?? 1), Math.round(sortOrder)]
     )
   }
 
@@ -366,7 +556,19 @@ async function upsertPart(client, cache, item, idx) {
 
   if (tgPn) {
     const { rows } = await client.query('SELECT part_id FROM tg.part WHERE tg_part_no=$1', [tgPn])
-    if (rows.length) { cache[cacheKey] = rows[0].part_id; return rows[0].part_id }
+    if (rows.length) {
+      // Update note + standards so re-import refreshes existing data
+      await client.query(
+        `UPDATE tg.part
+         SET notes             = COALESCE($1, notes),
+             product_standard  = $2,
+             material_standard = $3
+         WHERE part_id = $4`,
+        [item.note ?? null, item.product_standards ?? null, item.material_standards ?? null, rows[0].part_id]
+      )
+      cache[cacheKey] = rows[0].part_id
+      return rows[0].part_id
+    }
   }
 
   const insertTgPn = tgPn ?? `ANON-${Date.now()}-${idx}`
@@ -384,6 +586,12 @@ async function upsertPart(client, cache, item, idx) {
   )
   cache[cacheKey] = r.rows[0].part_id
   return r.rows[0].part_id
+}
+
+function savePdf(buffer, dsId) {
+  const filename = `bom-${dsId}-${Date.now()}.pdf`
+  fs.writeFileSync(path.join(PDF_DIR, filename), buffer)
+  return `/uploads/pdfs/${filename}`
 }
 
 // ── POST /api/import/pdf ──────────────────────────────────────────────────────
@@ -484,7 +692,25 @@ router.post('/pdf', upload.single('file'), async (req, res) => {
       // ── suffix revision → ใช้ reconcile logic แทน full insert ──
       if (useRevisionLogic) {
         await reconcileBomItems(client, dsId, items, partCache)
+
+        // Add revision record for re-import (first issue = 1, so first update = 2)
+        const { rows: lvRows } = await client.query(
+          `SELECT COALESCE(MAX(CASE WHEN mark ~ '^[0-9]+$' THEN mark::smallint ELSE 0 END), 0) AS max_level
+           FROM tg.bom_revision WHERE design_spec_id = $1`,
+          [dsId]
+        )
+        const maxLevel = lvRows[0].max_level ?? 0
+        const newMark = maxLevel === 0 ? 2 : maxLevel + 1
+        await client.query(
+          `INSERT INTO tg.bom_revision
+             (design_spec_id, sort_order, mark, revision_record, eci_no, revision_date)
+           VALUES ($1,$2,$3,'Update ECI No.',$4,$5)`,
+          [dsId, newMark, String(newMark), header.internal_eci_no, effDate]
+        )
+
         await client.query('COMMIT')
+        const pdfUrl = savePdf(req.file.buffer, dsId)
+        await pool.query('UPDATE tg.design_spec SET pdf_url=$1 WHERE design_spec_id=$2', [pdfUrl, dsId])
         res.json({ design_spec_id: dsId, customer_part_no: header.customer_part_no })
         return
       }
@@ -529,7 +755,7 @@ router.post('/pdf', upload.single('file'), async (req, res) => {
                (design_spec_id, variant_id, parent_part_id, child_part_id,
                 bom_level, level_code, quantity, sort_order)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-            [dsId, variantId, null, partId, level, item.level_code ?? null, item.quantity ?? 1, i]
+            [dsId, variantId, null, partId, level, item.level_code ?? null, Math.round(item.quantity ?? 1), i]
           )
           updateStack(ks, level, partId)
 
@@ -548,7 +774,7 @@ router.post('/pdf', upload.single('file'), async (req, res) => {
                   bom_level, level_code, quantity, sort_order)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
               [dsId, variantId, parentPartId, partId,
-               level, item.level_code ?? null, item.quantity ?? 1, i]
+               level, item.level_code ?? null, Math.round(item.quantity ?? 1), i]
             )
             updateStack(ks, level, partId)
           }
@@ -566,12 +792,14 @@ router.post('/pdf', upload.single('file'), async (req, res) => {
                (design_spec_id, variant_id, parent_part_id, child_part_id,
                 bom_level, level_code, quantity, sort_order)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-            [dsId, null, parentPartId, partId, level, item.level_code ?? null, item.quantity ?? 1, i]
+            [dsId, null, parentPartId, partId, level, item.level_code ?? null, Math.round(item.quantity ?? 1), i]
           )
         }
       }
 
       await client.query('COMMIT')
+      const pdfUrl = savePdf(req.file.buffer, dsId)
+      await pool.query('UPDATE tg.design_spec SET pdf_url=$1 WHERE design_spec_id=$2', [pdfUrl, dsId])
       res.json({ design_spec_id: dsId, customer_part_no: header.customer_part_no })
     } catch (e) {
       await client.query('ROLLBACK')
@@ -581,6 +809,88 @@ router.post('/pdf', upload.single('file'), async (req, res) => {
     }
   } catch (e) {
     console.error('Import error:', e)
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// ── POST /api/import/revision-preview/:id  — parse PDF and return diff (no DB write) ──
+router.post('/revision-preview/:id', upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' })
+  const dsId = parseInt(req.params.id)
+  try {
+    const extracted = await extractBomFromPdf(req.file.buffer)
+    const { header, items } = extracted
+    if (!header || !items?.length) {
+      return res.status(422).json({ error: 'ไม่พบข้อมูล BOM ใน PDF นี้' })
+    }
+
+    const [{ rows: existing }, { rows: dsRows }] = await Promise.all([
+      pool.query(
+        `SELECT b.bom_id, b.bom_level AS level, p.tg_part_no, p.part_name
+         FROM tg.bom b JOIN tg.part p ON p.part_id = b.child_part_id
+         WHERE b.design_spec_id = $1 AND (b.status IS NULL OR b.status = 'active')
+         ORDER BY b.sort_order`,
+        [dsId]
+      ),
+      pool.query('SELECT tg_part_no FROM tg.design_spec WHERE design_spec_id = $1', [dsId]),
+    ])
+
+    const currentTgt = dsRows[0]?.tg_part_no
+    const tgt_change = (header.tg_part_no && currentTgt && header.tg_part_no !== currentTgt)
+      ? { old: currentTgt, new: header.tg_part_no }
+      : null
+
+    const existingByPn = new Map(
+      existing.filter(r => r.tg_part_no).map(r => [r.tg_part_no, r])
+    )
+
+    const item_changes = []
+    const new_items = []
+    const seen = new Set()
+
+    for (const item of items) {
+      const newPn = item.tg_part_no?.trim()
+      if (!newPn || seen.has(newPn)) continue
+      seen.add(newPn)
+      if (existingByPn.has(newPn)) continue // unchanged
+
+      let found = false
+      for (const [oldPn, oldRow] of existingByPn.entries()) {
+        if (!isSuffixRevision(oldPn, newPn)) continue
+        item_changes.push({
+          bom_id: oldRow.bom_id,
+          old_pn: oldPn,
+          new_pn: newPn,
+          part_name: oldRow.part_name,
+          level: oldRow.level,
+        })
+        found = true
+        break
+      }
+      if (!found) {
+        new_items.push({ tg_part_no: newPn, part_name: item.part_name ?? '', level: item.level ?? 1 })
+      }
+    }
+
+    res.json({
+      tgt_change,
+      item_changes,
+      new_items,
+      header: { internal_eci_no: header.internal_eci_no, tg_part_no: header.tg_part_no },
+    })
+  } catch (e) {
+    console.error('Preview error:', e)
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// ── GET /api/import/pdf-text  (debug: show raw extracted text) ───────────────
+router.post('/pdf-text', upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file' })
+  try {
+    const text = await extractTextFromPdf(req.file.buffer)
+    res.json({ text, length: text.length })
+  } catch (e) {
     res.status(500).json({ error: e.message })
   }
 })

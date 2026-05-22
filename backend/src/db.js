@@ -76,6 +76,27 @@ export async function initDb() {
     )
   `)
 
+  // migration_004 — part image + allow null tg_part_no for manually-added parts
+  await pool.query(`ALTER TABLE tg.part ADD COLUMN IF NOT EXISTS image_url TEXT`)
+  await pool.query(`ALTER TABLE tg.part ALTER COLUMN tg_part_no DROP NOT NULL`)
+
+  // migration_005 — store original PDF file per design_spec
+  await pool.query(`ALTER TABLE tg.design_spec ADD COLUMN IF NOT EXISTS pdf_url TEXT`)
+
+  // migration_003 — approval tokens
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tg.approval_tokens (
+      id          BIGSERIAL PRIMARY KEY,
+      token       VARCHAR(64) UNIQUE NOT NULL,
+      bom_id      BIGINT NOT NULL,
+      sent_to     VARCHAR(255) NOT NULL,
+      sent_at     TIMESTAMPTZ DEFAULT NOW(),
+      approved_by VARCHAR(255),
+      approved_at TIMESTAMPTZ,
+      status      VARCHAR(20) DEFAULT 'pending'
+    )
+  `)
+
   const { rows } = await pool.query('SELECT COUNT(*) AS cnt FROM tg.bom')
   if (parseInt(rows[0].cnt) === 0) {
     console.log('Seeding tg.bom…')
