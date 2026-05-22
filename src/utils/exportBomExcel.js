@@ -83,6 +83,16 @@ function insertRevisedOut(flatRows, allItems) {
   return result
 }
 
+/* ── spec builder (same logic as BomDocumentView) ── */
+function buildSpec(row) {
+  const ok = v => v && String(v).trim() && String(v).trim().toUpperCase() !== 'NO'
+  return [
+    ok(row.note)               ? String(row.note).trim()               : null,
+    ok(row.product_standards)  ? String(row.product_standards).trim()  : null,
+    ok(row.material_standards) ? String(row.material_standards).trim() : null,
+  ].filter(Boolean).join('  ')
+}
+
 /* ── border helpers ── */
 const T = { style: 'thin', color: { argb: 'FF333333' } }
 const BORDER_ALL = { top: T, left: T, bottom: T, right: T }
@@ -158,33 +168,73 @@ export async function exportBomToExcel(bom) {
      BLOCK 1 — Document header (4 rows)
      ════════════════════════════════════════════ */
 
+  // Approval role columns (cols 16-25)
+  const APPR_COLS = [
+    [16, 17, 'Pro. Eng.'],
+    [18, 19, 'CO-OR'],
+    [20, 20, 'AGM'],
+    [21, 21, 'Mgr.'],
+    [22, 23, 'Purchase'],
+    [24, 25, 'Part\ncontrol'],
+  ]
 
-  // Row 1: BILL OF MATERIAL title
-  merge(ws, R, 1, R, 5);  setCell(ws, R, 1, 'Event Issue / Concern With', { bold: true, size: 7, border: BORDER_ALL, align: { horizontal: 'center', vertical: 'middle' } })
-  merge(ws, R, 6, R, 15); setCell(ws, R, 6, 'BILL OF MATERIAL',           { bold: true, size: 14, align: { horizontal: 'center', vertical: 'middle' }, border: BORDER_ALL })
-  merge(ws, R, 16, R+3, 25)
-  setCell(ws, R, 16, 'Approval Signatures', { bold: true, size: 7, align: { horizontal: 'center', vertical: 'middle' }, border: BORDER_ALL })
-  ws.getRow(R).height = 22
+  const chk = v => v ? '☑' : '□'
+
+  // Row 1: Event issue label | Concern with label | BILL OF MATERIAL | Customer Name/Date | Approval headers
+  merge(ws, R, 1, R, 2);  setCell(ws, R, 1, 'Event Issue',    { bold: true, size: 7, border: BORDER_ALL, align: { horizontal: 'center', vertical: 'middle' } })
+  merge(ws, R, 3, R, 4);  setCell(ws, R, 3, 'Concern with',   { bold: true, size: 7, border: BORDER_ALL, align: { horizontal: 'center', vertical: 'middle' } })
+  merge(ws, R, 5, R, 11); setCell(ws, R, 5, 'BILL OF MATERIAL', { bold: true, size: 14, border: BORDER_ALL, align: { horizontal: 'center', vertical: 'middle' } })
+  setCell(ws, R, 12, 'Customer Name :', { size: 7, border: BORDER_ALL, align: { horizontal: 'right', vertical: 'middle' } })
+  merge(ws, R, 13, R, 14); setCell(ws, R, 13, bom.customer_name ?? bom.customer ?? '', { bold: true, size: 8, border: BORDER_ALL, align: { horizontal: 'center', vertical: 'middle' } })
+  setCell(ws, R, 15, 'Date :', { size: 7, border: BORDER_ALL, align: { horizontal: 'right', vertical: 'middle' } })
+  APPR_COLS.forEach(([c1, c2, label]) => {
+    if (c1 < c2) merge(ws, R, c1, R, c2)
+    setCell(ws, R, c1, label, { bold: true, size: 7, border: BORDER_ALL, align: { horizontal: 'center', vertical: 'middle', wrapText: true } })
+  })
+  ws.getRow(R).height = 18
   R++
 
-  // Row 2: Type | Customer Part No.
-  merge(ws, R, 1, R, 3);  setCell(ws, R, 1, `Type : ${bom.type ?? 'HE'}`, { bold: true, size: 8, border: BORDER_ALL })
-  merge(ws, R, 4, R, 6);  setCell(ws, R, 4, `Customer Part No. : ${bom.customer_part_no ?? ''}`, { bold: true, size: 8, border: BORDER_ALL })
-  merge(ws, R, 7, R, 15); cell(ws, R, 7).border = BORDER_ALL
+  // Row 2: First issue / DAN | Drawing / Actual Part | (BOM title continues) | Date value | approval sig rows 2-4
+  setCell(ws, R, 1, `${chk(bom.evt_first_issue)} First issue`, { size: 7, border: BORDER_ALL, align: { vertical: 'middle' } })
+  setCell(ws, R, 2, `${chk(bom.evt_dan)} DAN`,                 { size: 7, border: BORDER_ALL, align: { vertical: 'middle' } })
+  setCell(ws, R, 3, `${chk(bom.concern_drawing)} Drawing / Rev. ~`,     { size: 7, border: BORDER_ALL, align: { vertical: 'middle' } })
+  setCell(ws, R, 4, `${chk(bom.concern_actual_part)} Actual Part : stage`, { size: 7, border: BORDER_ALL, align: { vertical: 'middle' } })
+  for (let c = 5; c <= 11; c++) { const cl = ws.getCell(R, c); cl.border = BORDER_ALL }
+  for (let c = 12; c <= 15; c++) { const cl = ws.getCell(R, c); cl.border = BORDER_ALL }
+  merge(ws, R, 15, R + 2, 15); setCell(ws, R, 15, bom.date ?? '', { bold: true, size: 8, border: BORDER_ALL, align: { horizontal: 'center', vertical: 'middle' } })
+  APPR_COLS.forEach(([c1, c2]) => {
+    merge(ws, R, c1, R + 2, c2)
+    ws.getCell(R, c1).border = BORDER_ALL
+  })
+  ws.getRow(R).height = 14
   R++
 
-  // Row 3: Model No. | TGT Part No. | Customer Name | Date
-  merge(ws, R, 1, R, 3);  setCell(ws, R, 1, `Model No. : ${bom.model ?? ''}`, { bold: true, size: 8, border: BORDER_ALL })
-  merge(ws, R, 4, R, 6);  setCell(ws, R, 4, `TGT Part No. : ${bom.tg_part_no ?? ''}`, { bold: true, size: 8, border: BORDER_ALL })
-  merge(ws, R, 7, R+1, 7);  setCell(ws, R, 7, 'Customer Name :', { size: 7, border: BORDER_ALL, align: { horizontal: 'center', vertical: 'middle' } })
-  merge(ws, R, 8, R+1, 10); setCell(ws, R, 8, bom.customer_name ?? bom.customer ?? '', { bold: true, size: 8, border: BORDER_ALL, align: { horizontal: 'center', vertical: 'middle' } })
-  merge(ws, R, 11, R+1, 11); setCell(ws, R, 11, 'Date :', { size: 7, border: BORDER_ALL, align: { horizontal: 'center', vertical: 'middle' } })
-  merge(ws, R, 12, R+1, 15); setCell(ws, R, 12, bom.date ?? '', { bold: true, size: 8, border: BORDER_ALL, align: { horizontal: 'center', vertical: 'middle' } })
+  // Row 3: CV / HIN | Type | Customer Part No.
+  setCell(ws, R, 1, `${chk(bom.evt_cv)} CV`,   { size: 7, border: BORDER_ALL, align: { vertical: 'middle' } })
+  setCell(ws, R, 2, `${chk(bom.evt_hin)} HIN`,  { size: 7, border: BORDER_ALL, align: { vertical: 'middle' } })
+  for (let c = 3; c <= 4; c++) ws.getCell(R, c).border = BORDER_ALL
+  merge(ws, R, 5, R, 6);   setCell(ws, R, 5, `Type : ${bom.type ?? 'HE'}`,          { bold: true, size: 8, border: BORDER_ALL })
+  merge(ws, R, 7, R, 11);  setCell(ws, R, 7, `Customer Part No. : ${bom.customer_part_no ?? ''}`, { bold: true, size: 8, border: BORDER_ALL })
+  merge(ws, R, 12, R, 14); ws.getCell(R, 12).border = BORDER_ALL
+  ws.getRow(R).height = 14
   R++
 
-  // Row 4: Model Name | Part Name
-  merge(ws, R, 1, R, 3); setCell(ws, R, 1, `Model Name : ${bom.model_name ?? ''}`, { bold: true, size: 8, border: BORDER_ALL })
-  merge(ws, R, 4, R, 6); setCell(ws, R, 4, `Part Name : ${bom.part_name ?? ''}`,   { bold: true, size: 8, border: BORDER_ALL })
+  // Row 4: MQ / SOP | Model No. | TGT Part No.
+  setCell(ws, R, 1, `${chk(bom.evt_mq)} MQ`,   { size: 7, border: BORDER_ALL, align: { vertical: 'middle' } })
+  setCell(ws, R, 2, `${chk(bom.evt_sop)} SOP`,  { size: 7, border: BORDER_ALL, align: { vertical: 'middle' } })
+  for (let c = 3; c <= 4; c++) ws.getCell(R, c).border = BORDER_ALL
+  merge(ws, R, 5, R, 6);   setCell(ws, R, 5, `Model No. : ${bom.model ?? ''}`,        { bold: true, size: 8, border: BORDER_ALL })
+  merge(ws, R, 7, R, 11);  setCell(ws, R, 7, `TGT Part No. : ${bom.tg_part_no ?? ''}`, { bold: true, size: 8, border: BORDER_ALL })
+  merge(ws, R, 12, R, 14); ws.getCell(R, 12).border = BORDER_ALL
+  ws.getRow(R).height = 14
+  R++
+
+  // Row 5: Model Name | Part Name
+  for (let c = 1; c <= 4; c++) ws.getCell(R, c).border = BORDER_ALL
+  merge(ws, R, 5, R, 6);   setCell(ws, R, 5, `Model Name : ${bom.model_name ?? ''}`,   { bold: true, size: 8, border: BORDER_ALL })
+  merge(ws, R, 7, R, 11);  setCell(ws, R, 7, `Part Name : ${bom.part_name ?? ''}`,      { bold: true, size: 8, border: BORDER_ALL })
+  merge(ws, R, 12, R, 14); ws.getCell(R, 12).border = BORDER_ALL
+  ws.getRow(R).height = 14
   R++
 
   /* ════════════════════════════════════════════
@@ -254,10 +304,10 @@ export async function exportBomToExcel(bom) {
     ws.getCell(R, lv).alignment = { vertical: 'middle', horizontal: 'left' }
 
     ws.getCell(R, 6).value  = row.part_name ?? ''
-    ws.getCell(R, 7).value  = row.material_standards ?? ''
+    ws.getCell(R, 7).value  = buildSpec(row)
     ws.getCell(R, 8).value  = row.quantity ?? ''
     ws.getCell(R, 9).value  = row.mass_g != null ? Number(row.mass_g) : ''
-    ws.getCell(R, 25).value = row.note ?? ''
+    // col 25 = Remark — left empty; note belongs in Material Spec (col 7)
 
     ws.getCell(R, 8).alignment  = { vertical: 'middle', horizontal: 'center' }
     ws.getCell(R, 9).alignment  = { vertical: 'middle', horizontal: 'center' }
@@ -333,9 +383,13 @@ export async function exportBomToExcel(bom) {
     R++
   }
 
-  // Route row
+  // Route row: FM form number (left) | ROUTE text (right)
+  merge(ws, R, 1, R, 6)
+  setCell(ws, R, 1, 'FM-PE30/SSE-007 Rev.01 (14/OCT/14) Approved SSE', {
+    size: 7, border: BORDER_ALL, align: { horizontal: 'left', vertical: 'middle', wrapText: true }
+  })
   merge(ws, R, 7, R, 25)
-  setCell(ws, R, 7, 'ROUTE : Production Eng. → (Before OTS = 2 months or 1 week after each event) → Purchase → 1 week → Plant Admin. → 1 week → Production Eng. (Keep)', {
+  setCell(ws, R, 7, 'ROUTE :  Production Eng.  →  (Before OTS = 2 months or 1 week after each event)  →  Purchase  →  1 week  →  Plant Admin.  →  1 week  →  Production Eng. (Keep)', {
     size: 7, border: BORDER_ALL, align: { horizontal: 'left', vertical: 'middle' }
   })
   ws.getRow(R).height = 12

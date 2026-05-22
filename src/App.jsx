@@ -118,6 +118,7 @@ export default function App() {
   const [error, setError]       = useState(null)
   const [saveMsg, setSaveMsg]   = useState(false)
   const [deleteConfirm, setDeleteConfirm] = useState(null)
+  const [homeSearch, setHomeSearch] = useState('')
   const fileRef = useRef(null)
 
   useEffect(() => { loadList() }, [])
@@ -207,9 +208,23 @@ export default function App() {
 
         {/* list */}
         {!uploading && <div className="home-section-title">รายการ BOM ล่าสุด</div>}
+        {!uploading && bomList.length > 0 && (
+          <input
+            className="home-search"
+            placeholder=" ค้นหา Part No. หรือชื่อ BOM…"
+            value={homeSearch}
+            onChange={e => setHomeSearch(e.target.value)}
+          />
+        )}
         {uploading ? null : bomList.length === 0
           ? <div className="home-empty">ยังไม่มี BOM — อัปโหลด PDF เพื่อเริ่มต้น</div>
-          : bomList.map(b => (
+          : bomList.filter(b => {
+              if (!homeSearch.trim()) return true
+              const q = homeSearch.toLowerCase()
+              return b.tg_part_no?.toLowerCase().includes(q) ||
+                     b.customer_part_no?.toLowerCase().includes(q) ||
+                     b.model?.toLowerCase().includes(q)
+            }).map(b => (
             <div key={b.id} className="home-card" onClick={() => selectBom(b.id)}>
               <div className="home-card-icon">📄</div>
               <div className="home-card-body">
@@ -253,7 +268,7 @@ export default function App() {
     <div className="shell">
       <div className="shell-topbar">
         <span className="shell-logo">BOM</span>
-        <span className="shell-title">BOM Management · Toyoda Gosei</span>
+        <span className="shell-title">BILL OF MATERIAL · Toyoda Gosei</span>
         <span className="shell-bom-id">{bom?.tg_part_no ?? ''}</span>
         <button className="shell-back" onClick={() => setView('home')}>← Home</button>
       </div>

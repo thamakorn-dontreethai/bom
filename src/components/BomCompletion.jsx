@@ -19,6 +19,7 @@ export default function BomCompletion({ bom, onRefresh }) {
   const [rows, setRows] = useState({})
   const [saving, setSaving] = useState(false)
   const [msg, setMsg] = useState(null)
+  const [search, setSearch] = useState('')
 
   // Part detail popup
   const [detail, setDetail] = useState(null)
@@ -33,7 +34,11 @@ export default function BomCompletion({ bom, onRefresh }) {
 
   const visible = items.filter(i => {
     const keys = parseKeyList(i.key_code)
-    return keys.length === 0 || keys.map(String).includes(activeKey)
+    const matchKey = keys.length === 0 || keys.map(String).includes(activeKey)
+    if (!matchKey) return false
+    if (!search.trim()) return true
+    const q = search.toLowerCase()
+    return i.tg_part_no?.toLowerCase().includes(q) || i.part_name?.toLowerCase().includes(q)
   })
 
   function getRow(id) { return rows[id] ?? { price: '', supplier: '–', lead_time: '', remark: '' } }
@@ -115,6 +120,20 @@ export default function BomCompletion({ bom, onRefresh }) {
           ))}
         </div>
       )}
+
+      <div className="comp-search-bar">
+        <input
+          className="comp-search-input"
+          placeholder="Search Part No. or Name Part…"
+          value={search}
+          onChange={e => setSearch(e.target.value)}
+        />
+        {search && (
+          <span className="comp-search-count">
+            {visible.length} รายการ
+          </span>
+        )}
+      </div>
 
       <div style={{ overflowX: 'auto' }}>
         <table className="comp-tbl">
