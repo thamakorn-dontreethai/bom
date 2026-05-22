@@ -17,6 +17,10 @@ dist-ssr
 .env.*
 !.env.example
 
+# User uploads (images, PDFs) — เก็บใน Docker volume แทน
+backend/uploads/pdfs/
+backend/uploads/parts/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
