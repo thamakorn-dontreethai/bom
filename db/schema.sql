@@ -44,9 +44,14 @@ CREATE TABLE tg.color (
 
 -- Variant = leather colour key (Key 1 = Black NH-900L, Key 2 = Gray NH-1168L)
 CREATE TABLE tg.product_variant (
-  variant_id   SERIAL      PRIMARY KEY,
-  variant_key  SMALLINT    NOT NULL UNIQUE,   -- 1 or 2
-  variant_name VARCHAR(100)                   -- e.g. NH-900L (Black)
+  variant_id       SERIAL      PRIMARY KEY,
+  design_spec_id   INT,
+  variant_key      SMALLINT    NOT NULL,
+  variant_name     VARCHAR(100),
+  customer_part_no VARCHAR(50),
+  tg_part_no       VARCHAR(50),
+  part_name        VARCHAR(200),
+  mass_gram        NUMERIC(10,3)
 );
 
 
@@ -56,7 +61,7 @@ CREATE TABLE tg.product_variant (
 
 CREATE TABLE tg.part (
   part_id               SERIAL        PRIMARY KEY,
-  tg_part_no            VARCHAR(50)   UNIQUE,           -- TG internal part number
+  tg_part_no            VARCHAR(50),                    -- TG internal part number
   customer_part_no      VARCHAR(50),
   part_name             VARCHAR(200)  NOT NULL,
 
@@ -170,7 +175,7 @@ CREATE TABLE tg.bom (
   child_part_id    INT          NOT NULL REFERENCES tg.part,
 
   -- Hierarchy
-  bom_level        SMALLINT     NOT NULL CHECK (bom_level BETWEEN 1 AND 5),
+  bom_level        SMALLINT     NOT NULL CHECK (bom_level BETWEEN 1 AND 6),
   level_code       VARCHAR(20),       -- pp_mold / level code printed in some columns
   sort_order       INT          NOT NULL DEFAULT 0,
 

@@ -1,86 +1,101 @@
 import ExcelJS from 'exceljs'
 
-/* ── helpers (mirrors BomDocumentView logic) ── */
-function findActiveReplacement(revisedOut, items) {
-  let current = revisedOut
-  while (current && current.status === 'revised_out') {
-    current = items.find(r =>
-      r.sort_order === current.sort_order + 1 &&
-      r.parent_id === current.parent_id
-    ) ?? null
-  }
-  return current
+/* ── row ordering — IDENTICAL to BomDocumentView so the export matches the
+     system exactly (the old buildTree/flatten approach dropped items). ── */
+
+// Active rows in stored document order; indentation comes from each row's `level`.
+function orderRows(items) {
+  return items
+    .filter(it => it.status !== 'revised_out')
+    .slice()
+    .sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0))
 }
-function buildTree(items) {
-  const map = {}
-  items.forEach(i => { map[i.id] = { ...i, children: [] } })
-  const finalRepOf = {}
-  items.forEach(it => {
-    if (it.status === 'revised_out' && it.sort_order != null) {
-      const rep = findActiveReplacement(it, items)
-      if (rep) finalRepOf[it.id] = rep
-    }
-  })
-  const rootItem = items.find(i => (i.level ?? i.bom_level) === 1 && i.status !== 'revised_out')
-  const roots = []
-  items.forEach(i => {
-    if (i.status === 'revised_out') return
-    let parentId = i.parent_id
-    if (parentId && map[parentId] && map[parentId].status === 'revised_out') {
-      const rep = finalRepOf[parentId]
-      parentId = rep ? rep.id : null
-    }
-    if (parentId && map[parentId]) { map[parentId].children.push(map[i.id]) }
-    else if (rootItem && map[rootItem.id] && i.id !== rootItem.id) { map[rootItem.id].children.push(map[i.id]) }
-    else { roots.push(map[i.id]) }
-  })
-  return roots
-}
-function flatten(nodes) {
-  const out = []
-  for (const n of nodes) { out.push(n); if (n.children?.length) out.push(...flatten(n.children)) }
-  return out
-}
+
+// Place each revised_out item before its final active successor; inject a
+// synthetic _custPnOnly header for Level-1 items that carry a customer_part_no.
 function insertRevisedOut(flatRows, allItems) {
-  function followChain(start) {
-    const chain = []
-    let current = start
-    while (current && current.status === 'revised_out') {
-      chain.push(current)
-      current = allItems.find(r =>
-        r.sort_order === current.sort_order + 1 &&
-        r.parent_id === current.parent_id
-      ) ?? null
-    }
-    return { chain, finalRep: current }
-  }
   const insertBefore = {}
-  const processedIds = new Set()
   allItems.forEach(it => {
-    if (it.status !== 'revised_out' || processedIds.has(it.id) || it.sort_order == null) return
-    const hasPrev = allItems.some(r =>
-      r.status === 'revised_out' &&
-      r.sort_order === it.sort_order - 1 &&
-      r.parent_id === it.parent_id
-    )
-    if (hasPrev) return
-    const { chain, finalRep } = followChain(it)
-    chain.forEach(c => processedIds.add(c.id))
-    if (finalRep) {
-      if (!insertBefore[finalRep.id]) insertBefore[finalRep.id] = []
-      insertBefore[finalRep.id].push(...chain)
+    if (it.status !== 'revised_out' || it.sort_order == null) return
+    let finalActive = allItems
+      .filter(r => r.sort_order > it.sort_order && r.parent_id === it.parent_id && r.key_code === it.key_code)
+      .sort((a, b) => a.sort_order - b.sort_order)[0] ?? null
+    while (finalActive && finalActive.status === 'revised_out') {
+      finalActive = allItems
+        .filter(r => r.sort_order > finalActive.sort_order && r.parent_id === finalActive.parent_id && r.key_code === finalActive.key_code)
+        .sort((a, b) => a.sort_order - b.sort_order)[0] ?? null
+    }
+    if (finalActive) {
+      if (!insertBefore[finalActive.id]) insertBefore[finalActive.id] = []
+      insertBefore[finalActive.id].push(it)
     }
   })
+  Object.values(insertBefore).forEach(arr => arr.sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0)))
+
   const result = []
   const placed = new Set()
   for (const row of flatRows) {
     if (row?.id != null && insertBefore[row.id]) {
+      const lv = row.level ?? row.bom_level ?? 1
+      const hasCust = lv === 1 && !!row.customer_part_no && row.status !== 'revised_out'
+      if (hasCust) result.push({ ...row, _custPnOnly: true })
       for (const ro of insertBefore[row.id]) { result.push(ro); placed.add(ro.id) }
+      result.push(hasCust ? { ...row, _skipCustPn: true } : row)
+    } else {
+      result.push(row)
     }
-    result.push(row)
   }
-  allItems.forEach(it => { if (it.status === 'revised_out' && !placed.has(it.id)) result.push(it) })
+  allItems.forEach(it => {
+    if (it.status !== 'revised_out' || placed.has(it.id)) return
+    result.push(it)
+  })
   return result
+}
+
+/* ── key list parser ── */
+function parseKeyList(keyCode) {
+  if (!keyCode) return []
+  const s = String(keyCode).trim()
+  const range = s.match(/^(\d+)-(\d+)$/)
+  if (range) {
+    const start = parseInt(range[1]), end = parseInt(range[2])
+    const out = []
+    for (let k = start; k <= end; k++) out.push(k)
+    return out
+  }
+  if (s.includes(',')) return s.split(',').map(n => parseInt(n.trim())).filter(n => !isNaN(n))
+  const n = parseInt(s)
+  return isNaN(n) ? [] : [n]
+}
+
+// Page rows by variant key (same BFS as the document view): each key's page =
+// its own items + the null-key sub-parts reachable from them.
+function groupByKey(items) {
+  const keyed = {}
+  const shared = []
+  const allKeys = new Set()
+  items.forEach(it => {
+    const keys = parseKeyList(it.key_code)
+    if (keys.length === 0) shared.push(it)
+    else keys.forEach(k => { const ks = String(k); allKeys.add(ks); if (!keyed[ks]) keyed[ks] = []; keyed[ks].push(it) })
+  })
+  const sortedKeys = [...allKeys].sort((a, b) => Number(a) - Number(b))
+  if (!sortedKeys.length) {
+    const pageItems = [...shared]
+    return [{ key: '0', rows: insertRevisedOut(orderRows(pageItems), pageItems) }]
+  }
+  return sortedKeys.map(k => {
+    const seed = new Set(keyed[k].map(it => it.id))
+    let changed = true
+    while (changed) {
+      changed = false
+      for (const it of shared) {
+        if (!seed.has(it.id) && it.parent_id != null && seed.has(it.parent_id)) { seed.add(it.id); changed = true }
+      }
+    }
+    const pageItems = [...keyed[k], ...shared.filter(it => seed.has(it.id))]
+    return { key: k, rows: insertRevisedOut(orderRows(pageItems), pageItems) }
+  })
 }
 
 /* ── spec builder (same logic as BomDocumentView) ── */
@@ -93,314 +108,212 @@ function buildSpec(row) {
   ].filter(Boolean).join('  ')
 }
 
-/* ── border helpers ── */
-const T = { style: 'thin', color: { argb: 'FF333333' } }
-const BORDER_ALL = { top: T, left: T, bottom: T, right: T }
+/* ════════════════════════════════════════════════════════════════════════
+   Template-based export — load the real BOM .xlsx and inject data into it.
+   Layout of each template (column numbers, meta cells, data area, revision
+   block) was captured directly from the production files in /public/templates.
+   ════════════════════════════════════════════════════════════════════════ */
+const setV = (ws, addr, val) => { ws.getCell(addr).value = val ?? null }
 
-function cell(ws, r, c) { return ws.getCell(r, c) }
-
-function setCell(ws, r, c, value, opts = {}) {
-  const cl = ws.getCell(r, c)
-  cl.value = value ?? null
-  if (opts.bold)          cl.font = { ...(cl.font ?? {}), bold: true, size: opts.size ?? 8, name: 'Arial' }
-  else                    cl.font = { size: opts.size ?? 8, name: 'Arial', ...(opts.font ?? {}) }
-  if (opts.strike)        cl.font = { ...cl.font, strike: true, color: { argb: 'FFCC0000' } }
-  if (opts.border)        cl.border = opts.border
-  if (opts.fill)          cl.fill = opts.fill
-  if (opts.align)         cl.alignment = opts.align
-  return cl
+const HE_CFG = {
+  file: 'templates/bom-he.xlsx',
+  font: { name: 'Tahoma', size: 11 },
+  levelCol: { 1: 2, 2: 3, 3: 5, 4: 6, 5: 7 },   // B, C(:D), E, F, G
+  maxLv: 5,
+  partNoAlign: 'left',
+  rowMerges: [[3, 4], [8, 11]],                   // C:D (Lv2), H:K (Part name)
+  partName: 8,                                    // H (:K)
+  spec: 12, qty: 13, wPart: 14, wGate: 15, price: 16,
+  mcost: 17,                                      // Q..U
+  sup: 22,                                        // V..Y
+  recv: 26, icode: 27, kanban: 28, lead: 29, remark: 30,
+  fieldCols: [2, 3, 5, 6, 7, 8, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30],
+  dataStart: 11, dataEnd: 72,
+  writeMeta(ws, bom) {
+    setV(ws, 'D6', bom.type ?? 'HE')
+    setV(ws, 'G6', `: ${bom.customer_part_no ?? ''}`)
+    setV(ws, 'D7', bom.model ?? '')
+    setV(ws, 'G7', `: ${bom.tg_part_no ?? ''}`)
+    setV(ws, 'M7', bom.customer_name ?? bom.customer ?? '')
+    setV(ws, 'Q7', bom.date ?? '')
+    setV(ws, 'D8', bom.model_name ?? '')
+    setV(ws, 'G8', `: ${bom.part_name ?? ''}`)
+  },
+  rev: { start: 76, max: 7, mark: 12, rec: 13, eci: 23, date: 25, rsnr: 27, appr: 29 },
 }
 
-function merge(ws, r1, c1, r2, c2) {
-  ws.mergeCells(r1, c1, r2, c2)
+const BAG_CFG = {
+  file: 'templates/bom-bag.xlsx',
+  font: { name: 'Tahoma', size: 8 },
+  levelCol: { 1: 1, 2: 2, 3: 4, 4: 5, 5: 6, 6: 8 },   // A, B(:C), D, E, F(:G), H
+  maxLv: 6,
+  partNoAlign: 'center',
+  rowMerges: [[2, 3], [6, 7], [9, 10]],                // B:C (Lv2), F:G (Lv5), I:J (Part name)
+  partName: 9,                                          // I (:J)
+  spec: 11, qty: 12, wPart: 13, wGate: 14, price: 15,
+  mcost: 16,                                            // P..T
+  sup: 21,                                              // U..X
+  recv: 25, icode: 26, kanban: 27, lead: 28, remark: 29,
+  fieldCols: [1, 2, 4, 5, 6, 8, 9, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29],
+  dataStart: 11, dataEnd: 119,
+  writeMeta(ws, bom) {
+    setV(ws, 'C7', bom.model ?? '')
+    setV(ws, 'G7', bom.tg_part_no ?? '')
+    setV(ws, 'L7', bom.customer_name ?? bom.customer ?? '')
+    setV(ws, 'P7', bom.date ?? '')
+    setV(ws, 'C8', bom.model_name ?? '')
+    setV(ws, 'G8', bom.part_name ?? '')
+  },
+  rev: { start: 165, max: 7, mark: 11, rec: 12, eci: 22, date: 24, rsnr: 26, appr: 28 },
 }
 
-/* ── column widths
-     A3 landscape usable width ≈ 390mm ≈ 1480pt
-     Total original px: 85×5+160+260+30+26+26+54+26×5+24×4+26+30+30+28+36 = 1357px
-     Scale to fit A3: multiply by ~1.05 then convert px→Excel chars (÷7.5)
-── */
-const COL_PX = [85,85,85,85,85, 160,260, 30,26,26,54, 26,26,26,26,26, 24,24,24,24, 26,30,30,28,36]
-const SCALE   = 1.05
-const PX2CH   = 7.5
+/* ── fill ONE worksheet (one variant key) from the loaded template ── */
+function fillSheet(ws, cfg, bom, page, usedNames) {
+  const rows = (page?.rows ?? []).filter(Boolean)
 
-/* ── main export function ── */
-export async function exportBomToExcel(bom) {
-  const items = bom.items ?? []
-  const tree  = buildTree(items)
-  const flat  = flatten(tree)
-  const rows  = insertRevisedOut(flat, items)
-
-  const revisions = bom.revisions?.length > 0
-    ? bom.revisions
-    : [{ mark: '–', revision_record: '', eci_no: bom.internal_eci_no, revision_date: bom.date }]
-
-  const wb = new ExcelJS.Workbook()
-  wb.creator = 'BOM System'
-  const ws = wb.addWorksheet('BOM', {
-    pageSetup: {
-      paperSize:   8,          // A3
-      orientation: 'landscape',
-      fitToPage:   true,
-      fitToWidth:  1,
-      fitToHeight: 0,
-      horizontalCentered: false,
-    },
-    headerFooter: {},
-  })
-
-  // Narrow margins (cm → inches: /2.54)
-  ws.pageSetup.margins = {
-    left: 0.25, right: 0.25,
-    top:  0.5,  bottom: 0.5,
-    header: 0,  footer: 0,
+  // Header TGT/FG Part No + Part name are PER-KEY (the page's Level-1 item).
+  const pageLv1 = rows.find(r => r && (r.level ?? r.bom_level) === 1 && r.status !== 'revised_out' && !r._custPnOnly)
+  const meta = {
+    ...bom,
+    tg_part_no: pageLv1?.tg_part_no ?? bom.tg_part_no,
+    part_name:  pageLv1?.part_name  ?? bom.part_name,
   }
 
-  // Set column widths scaled for A3
-  ws.columns = COL_PX.map((px, i) => ({
-    key:   `c${i+1}`,
-    width: Math.max((px * SCALE) / PX2CH, 3),
-  }))
+  // Unique sheet name from the key's part number.
+  const base = String(meta.tg_part_no ?? 'BOM').replace(/[\\/?*[\]:]/g, '').slice(0, 28) || 'BOM'
+  let name = base, k = 2
+  while (usedNames.has(name)) name = `${base} (${k++})`.slice(0, 31)
+  usedNames.add(name)
+  try { ws.name = name } catch { /* ignore */ }
 
-  let R = 1 // current row counter
+  // Drop the template's "Page 1" watermark + sample △ images.
+  ws.views = (ws.views?.length ? ws.views : [{}]).map(v => ({ ...v, state: 'normal', style: undefined }))
+  if (Array.isArray(ws._media)) ws._media.length = 0
 
-  /* ════════════════════════════════════════════
-     BLOCK 1 — Document header (4 rows)
-     ════════════════════════════════════════════ */
+  // Header meta (per-key values)
+  cfg.writeMeta(ws, meta)
 
-  // Approval role columns (cols 16-25)
-  const APPR_COLS = [
-    [16, 17, 'Pro. Eng.'],
-    [18, 19, 'CO-OR'],
-    [20, 20, 'AGM'],
-    [21, 21, 'Mgr.'],
-    [22, 23, 'Purchase'],
-    [24, 25, 'Part\ncontrol'],
-  ]
+  // Clear the template's sample data rows (preserve borders/format).
+  // NOTE: assign cell.style (not cell.font) — loaded templates share a single
+  // style object across a column, so `cell.font = …` leaks into sibling cells.
+  const normalFont = { ...cfg.font }
+  const redFont = { ...cfg.font, color: { argb: 'FFFF0000' }, strike: true }
+  const noFill = { type: 'pattern', pattern: 'none' }
+  const setFont = (cell, font) => { cell.style = { ...cell.style, font: { ...font } } }
+  for (let r = cfg.dataStart; r <= cfg.dataEnd; r++) {
+    for (let c = 1; c <= cfg.remark; c++) {
+      const cell = ws.getCell(r, c)
+      cell.style = { ...cell.style, fill: noFill }
+    }
+    for (const c of cfg.fieldCols) {
+      const cell = ws.getCell(r, c)
+      cell.value = null
+      setFont(cell, normalFont)
+    }
+    for (const [c1, c2] of cfg.rowMerges) {
+      try { ws.unMergeCells(r, c1, r, c2) } catch { /* wasn't merged */ }
+      try { ws.mergeCells(r, c1, r, c2) } catch { /* overlap — leave as is */ }
+    }
+  }
 
-  const chk = v => v ? '☑' : '□'
-
-  // Row 1: Event issue label | Concern with label | BILL OF MATERIAL | Customer Name/Date | Approval headers
-  merge(ws, R, 1, R, 2);  setCell(ws, R, 1, 'Event Issue',    { bold: true, size: 7, border: BORDER_ALL, align: { horizontal: 'center', vertical: 'middle' } })
-  merge(ws, R, 3, R, 4);  setCell(ws, R, 3, 'Concern with',   { bold: true, size: 7, border: BORDER_ALL, align: { horizontal: 'center', vertical: 'middle' } })
-  merge(ws, R, 5, R, 11); setCell(ws, R, 5, 'BILL OF MATERIAL', { bold: true, size: 14, border: BORDER_ALL, align: { horizontal: 'center', vertical: 'middle' } })
-  setCell(ws, R, 12, 'Customer Name :', { size: 7, border: BORDER_ALL, align: { horizontal: 'right', vertical: 'middle' } })
-  merge(ws, R, 13, R, 14); setCell(ws, R, 13, bom.customer_name ?? bom.customer ?? '', { bold: true, size: 8, border: BORDER_ALL, align: { horizontal: 'center', vertical: 'middle' } })
-  setCell(ws, R, 15, 'Date :', { size: 7, border: BORDER_ALL, align: { horizontal: 'right', vertical: 'middle' } })
-  APPR_COLS.forEach(([c1, c2, label]) => {
-    if (c1 < c2) merge(ws, R, c1, R, c2)
-    setCell(ws, R, c1, label, { bold: true, size: 7, border: BORDER_ALL, align: { horizontal: 'center', vertical: 'middle', wrapText: true } })
-  })
-  ws.getRow(R).height = 18
-  R++
-
-  // Row 2: First issue / DAN | Drawing / Actual Part | (BOM title continues) | Date value | approval sig rows 2-4
-  setCell(ws, R, 1, `${chk(bom.evt_first_issue)} First issue`, { size: 7, border: BORDER_ALL, align: { vertical: 'middle' } })
-  setCell(ws, R, 2, `${chk(bom.evt_dan)} DAN`,                 { size: 7, border: BORDER_ALL, align: { vertical: 'middle' } })
-  setCell(ws, R, 3, `${chk(bom.concern_drawing)} Drawing / Rev. ~`,     { size: 7, border: BORDER_ALL, align: { vertical: 'middle' } })
-  setCell(ws, R, 4, `${chk(bom.concern_actual_part)} Actual Part : stage`, { size: 7, border: BORDER_ALL, align: { vertical: 'middle' } })
-  for (let c = 5; c <= 11; c++) { const cl = ws.getCell(R, c); cl.border = BORDER_ALL }
-  for (let c = 12; c <= 15; c++) { const cl = ws.getCell(R, c); cl.border = BORDER_ALL }
-  merge(ws, R, 15, R + 2, 15); setCell(ws, R, 15, bom.date ?? '', { bold: true, size: 8, border: BORDER_ALL, align: { horizontal: 'center', vertical: 'middle' } })
-  APPR_COLS.forEach(([c1, c2]) => {
-    merge(ws, R, c1, R + 2, c2)
-    ws.getCell(R, c1).border = BORDER_ALL
-  })
-  ws.getRow(R).height = 14
-  R++
-
-  // Row 3: CV / HIN | Type | Customer Part No.
-  setCell(ws, R, 1, `${chk(bom.evt_cv)} CV`,   { size: 7, border: BORDER_ALL, align: { vertical: 'middle' } })
-  setCell(ws, R, 2, `${chk(bom.evt_hin)} HIN`,  { size: 7, border: BORDER_ALL, align: { vertical: 'middle' } })
-  for (let c = 3; c <= 4; c++) ws.getCell(R, c).border = BORDER_ALL
-  merge(ws, R, 5, R, 6);   setCell(ws, R, 5, `Type : ${bom.type ?? 'HE'}`,          { bold: true, size: 8, border: BORDER_ALL })
-  merge(ws, R, 7, R, 11);  setCell(ws, R, 7, `Customer Part No. : ${bom.customer_part_no ?? ''}`, { bold: true, size: 8, border: BORDER_ALL })
-  merge(ws, R, 12, R, 14); ws.getCell(R, 12).border = BORDER_ALL
-  ws.getRow(R).height = 14
-  R++
-
-  // Row 4: MQ / SOP | Model No. | TGT Part No.
-  setCell(ws, R, 1, `${chk(bom.evt_mq)} MQ`,   { size: 7, border: BORDER_ALL, align: { vertical: 'middle' } })
-  setCell(ws, R, 2, `${chk(bom.evt_sop)} SOP`,  { size: 7, border: BORDER_ALL, align: { vertical: 'middle' } })
-  for (let c = 3; c <= 4; c++) ws.getCell(R, c).border = BORDER_ALL
-  merge(ws, R, 5, R, 6);   setCell(ws, R, 5, `Model No. : ${bom.model ?? ''}`,        { bold: true, size: 8, border: BORDER_ALL })
-  merge(ws, R, 7, R, 11);  setCell(ws, R, 7, `TGT Part No. : ${bom.tg_part_no ?? ''}`, { bold: true, size: 8, border: BORDER_ALL })
-  merge(ws, R, 12, R, 14); ws.getCell(R, 12).border = BORDER_ALL
-  ws.getRow(R).height = 14
-  R++
-
-  // Row 5: Model Name | Part Name
-  for (let c = 1; c <= 4; c++) ws.getCell(R, c).border = BORDER_ALL
-  merge(ws, R, 5, R, 6);   setCell(ws, R, 5, `Model Name : ${bom.model_name ?? ''}`,   { bold: true, size: 8, border: BORDER_ALL })
-  merge(ws, R, 7, R, 11);  setCell(ws, R, 7, `Part Name : ${bom.part_name ?? ''}`,      { bold: true, size: 8, border: BORDER_ALL })
-  merge(ws, R, 12, R, 14); ws.getCell(R, 12).border = BORDER_ALL
-  ws.getRow(R).height = 14
-  R++
-
-  /* ════════════════════════════════════════════
-     BLOCK 2 — BOM table headers (2 rows)
-     ════════════════════════════════════════════ */
-  const TH_FILL = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFD9E1F2' } }
-  const thOpts  = { bold: true, size: 7, border: BORDER_ALL, fill: TH_FILL, align: { horizontal: 'center', vertical: 'middle', wrapText: true } }
-
-  // Header row 1
-  merge(ws, R, 1, R, 5);     setCell(ws, R, 1,  'Part No.',                     thOpts)
-  merge(ws, R+1, 1, R+1, 1); // level 1 sub-header
-  merge(ws, R, 6, R+1, 6);   setCell(ws, R, 6,  'Part name',                    thOpts)
-  merge(ws, R, 7, R+1, 7);   setCell(ws, R, 7,  'Material\nSpec',               thOpts)
-  merge(ws, R, 8, R+1, 8);   setCell(ws, R, 8,  "Q'ty\n(pcs.)",                 thOpts)
-  merge(ws, R, 9, R, 10);    setCell(ws, R, 9,  'Weight\n(g./pc.)',              thOpts)
-  merge(ws, R, 11, R+1, 11); setCell(ws, R, 11, 'Price/pcs,\nkgs (baht)',        thOpts)
-  merge(ws, R, 12, R, 16);   setCell(ws, R, 12, 'Material cost/unit (baht)',     thOpts)
-  merge(ws, R, 17, R, 20);   setCell(ws, R, 17, 'Supplier',                      thOpts)
-  merge(ws, R, 21, R+1, 21); setCell(ws, R, 21, 'Recie-\nver',                  thOpts)
-  merge(ws, R, 22, R+1, 22); setCell(ws, R, 22, 'Internal\nCode',               thOpts)
-  merge(ws, R, 23, R+1, 23); setCell(ws, R, 23, "Q'ty/\nkanban",                thOpts)
-  merge(ws, R, 24, R+1, 24); setCell(ws, R, 24, 'Lead\ntime\n(day)',             thOpts)
-  merge(ws, R, 25, R+1, 25); setCell(ws, R, 25, 'Remark',                       thOpts)
-  ws.getRow(R).height = 22
-  R++
-
-  // Header row 2 — sub-headers
-  for (let n = 1; n <= 5; n++) setCell(ws, R, n, String(n), thOpts)
-  setCell(ws, R, 9,  'Part', thOpts)
-  setCell(ws, R, 10, 'Gate', thOpts)
-  for (let n = 1; n <= 5; n++) setCell(ws, R, 11+n, String(n), thOpts)
-  ;['M/C','T/T','Local','Import'].forEach((s,i) => setCell(ws, R, 17+i, s, thOpts))
-  ws.getRow(R).height = 12
-  R++
-
-  /* ════════════════════════════════════════════
-     BLOCK 2 — BOM item rows
-     ════════════════════════════════════════════ */
-  const itemBaseFont = { size: 7, name: 'Arial' }
-
-  rows.forEach(row => {
-    const lv = row.level ?? 1
+  // Inject BOM rows
+  rows.forEach((row, i) => {
+    const R = cfg.dataStart + i
+    if (R > cfg.dataEnd) return   // overflow guard
     const isOut = row.status === 'revised_out'
+    const font = isOut ? redFont : normalFont
     const updateLevel = row.update_level ?? 0
     const displayLevel = isOut ? updateLevel - 1 : updateLevel
-    const tri = displayLevel > 0 ? `△${displayLevel} ` : ''
+    const tri = (!row._custPnOnly && displayLevel > 0) ? `△${displayLevel} ` : ''
+    const partNo = row._custPnOnly ? (row.customer_part_no ?? '') : (row.tg_part_no ?? '')
+    const lv = Math.min(row.level ?? row.bom_level ?? 1, cfg.maxLv)
+    const lvCol = cfg.levelCol[lv]
 
-    // Part No. in correct level column
-    const pnText = tri + (row.tg_part_no ?? '')
-    const rowFont = isOut
-      ? { size: 7, name: 'Arial', strike: true, color: { argb: 'FFCC0000' } }
-      : itemBaseFont
-
-    const exRow = ws.getRow(R)
-    exRow.height = 11
-
-    // Clear all 25 cells first with border
-    for (let c = 1; c <= 25; c++) {
-      const cl = ws.getCell(R, c)
-      cl.border = BORDER_ALL
-      cl.font   = rowFont
-      cl.alignment = { vertical: 'middle', wrapText: false }
+    const put = (c, v, numFmt) => {
+      const cell = ws.getCell(R, c)
+      cell.value = v
+      setFont(cell, font)
+      if (numFmt) cell.numFmt = numFmt
     }
-
-    // Level column for Part No.
-    ws.getCell(R, lv).value = pnText
-    ws.getCell(R, lv).alignment = { vertical: 'middle', horizontal: 'left' }
-
-    ws.getCell(R, 6).value  = row.part_name ?? ''
-    ws.getCell(R, 7).value  = buildSpec(row)
-    ws.getCell(R, 8).value  = row.quantity ?? ''
-    ws.getCell(R, 9).value  = row.mass_g != null ? Number(row.mass_g) : ''
-    // col 25 = Remark — left empty; note belongs in Material Spec (col 7)
-
-    ws.getCell(R, 8).alignment  = { vertical: 'middle', horizontal: 'center' }
-    ws.getCell(R, 9).alignment  = { vertical: 'middle', horizontal: 'center' }
-    ws.getCell(R, 10).alignment = { vertical: 'middle', horizontal: 'center' }
-
-    R++
+    put(lvCol, tri + partNo)
+    const pnCell = ws.getCell(R, lvCol)
+    pnCell.style = { ...pnCell.style, alignment: { ...pnCell.style?.alignment, horizontal: cfg.partNoAlign, vertical: 'middle' } }
+    put(cfg.partName, row.part_name ?? '')
+    put(cfg.spec, buildSpec(row))
+    put(cfg.qty, row.quantity != null && row.quantity !== '' ? parseFloat(row.quantity) : '')
+    put(cfg.wPart, row.mass_g != null ? Number(row.mass_g) : '', '#,##0.###')
+    put(cfg.wGate, row.gate ?? '')
+    put(cfg.price, row.price_per_pc != null ? Number(row.price_per_pc) : '')
+    put(cfg.mcost, row.material_cost != null ? Number(row.material_cost) : '')
+    ;['M/C', 'T/T', 'Local', 'Import'].forEach((s, j) => put(cfg.sup + j, row.completion_supplier === s ? '✓' : ''))
+    put(cfg.recv, row.receiver ?? '')
+    put(cfg.icode, row.internal_code ?? '')
+    put(cfg.kanban, row.kanban_qty ?? '')
+    put(cfg.lead, row.lead_time_day ?? '')
+    put(cfg.remark, row.completion_remark ?? '')
   })
 
-  /* ── A/B/C marks row ── */
-  const markGroups = [
-    [1,5,'A'],[6,6,'A'],[7,7,'A'],[8,9,'A'],[10,11,'C'],
-    [12,16,'C'],[17,20,'C'],[21,21,'B'],[22,22,'B'],[23,23,'B'],[24,25,'C']
-  ]
-  const markOpts = { bold: true, size: 7, border: BORDER_ALL, align: { horizontal: 'center', vertical: 'middle' }, fill: TH_FILL }
-  markGroups.forEach(([c1,c2,lbl]) => {
-    if (c1 !== c2) merge(ws, R, c1, R, c2)
-    setCell(ws, R, c1, lbl, markOpts)
-  })
-  ws.getRow(R).height = 10
-  R++
-
-  /* ════════════════════════════════════════════
-     BLOCK 3 — Footer: spacer row + revision headers
-     ════════════════════════════════════════════ */
-  R++ // spacer gap
-
-  // Revision header row
-  const revHdrOpts = { bold: true, size: 7, border: BORDER_ALL, fill: TH_FILL, align: { horizontal: 'center', vertical: 'middle' } }
-  merge(ws, R, 7, R, 7);   setCell(ws, R, 7,  'Mark',            revHdrOpts)
-  merge(ws, R, 8, R, 17);  setCell(ws, R, 8,  'Revision record', revHdrOpts)
-  merge(ws, R, 18, R, 19); setCell(ws, R, 18, 'ECI No.',         revHdrOpts)
-  merge(ws, R, 20, R, 21); setCell(ws, R, 20, 'Date',            revHdrOpts)
-  merge(ws, R, 22, R, 23); setCell(ws, R, 22, 'Revisioner',      revHdrOpts)
-  merge(ws, R, 24, R, 25); setCell(ws, R, 24, 'Approved',        revHdrOpts)
-  ws.getRow(R).height = 12
-  R++
-
-  // Note cell (spans all revision data+empty rows)
-  const emptyCount  = Math.max(0, 6 - revisions.length)
-  const noteRowSpan = revisions.length + emptyCount
-  merge(ws, R, 1, R + noteRowSpan - 1, 6)
-  const noteCell = ws.getCell(R, 1)
-  noteCell.value = "Note :\n'A' = Record by Engineering section  Update ECI No.\n'B' = Record by Part Control section\n'C' = Record by Purchase section"
-  noteCell.font  = { size: 7, name: 'Arial' }
-  noteCell.alignment = { vertical: 'top', wrapText: true }
-  noteCell.border = BORDER_ALL
-
-  // Revision data rows
-  revisions.forEach((rev) => {
-    const isFirst = !rev.mark || rev.mark === '–' || rev.mark === '-'
-    const markText = isFirst ? '△' : `△${rev.mark}`
-    const revOpts = { size: 7, border: BORDER_ALL, align: { horizontal: 'center', vertical: 'middle' } }
-
-    merge(ws, R, 7, R, 7);   setCell(ws, R, 7,  markText,              revOpts)
-    merge(ws, R, 8, R, 17);  setCell(ws, R, 8,  rev.revision_record ?? '', { size: 7, border: BORDER_ALL, align: { vertical: 'middle' } })
-    merge(ws, R, 18, R, 19); setCell(ws, R, 18, rev.eci_no ?? '',          revOpts)
-    merge(ws, R, 20, R, 21); setCell(ws, R, 20, rev.revision_date ?? '',   revOpts)
-    merge(ws, R, 22, R, 23); setCell(ws, R, 22, rev.revisioner ?? '',      revOpts)
-    merge(ws, R, 24, R, 25); setCell(ws, R, 24, rev.approved_by ?? '',     revOpts)
-    ws.getRow(R).height = 12
-    R++
-  })
-
-  // Empty revision rows
-  for (let i = 0; i < emptyCount; i++) {
-    merge(ws, R, 7, R, 7);   ws.getCell(R, 7).border  = BORDER_ALL
-    merge(ws, R, 8, R, 17);  ws.getCell(R, 8).border  = BORDER_ALL
-    merge(ws, R, 18, R, 19); ws.getCell(R, 18).border = BORDER_ALL
-    merge(ws, R, 20, R, 21); ws.getCell(R, 20).border = BORDER_ALL
-    merge(ws, R, 22, R, 23); ws.getCell(R, 22).border = BORDER_ALL
-    merge(ws, R, 24, R, 25); ws.getCell(R, 24).border = BORDER_ALL
-    ws.getRow(R).height = 12
-    R++
+  // Revision record — prepend a synthetic "First issue" unless data has one.
+  if (cfg.rev) {
+    const rawRevs = bom.revisions ?? []
+    const hasFirstIssue = rawRevs.some(r => !r.mark || r.mark === '–' || r.mark === '-')
+    const revs = hasFirstIssue
+      ? rawRevs
+      : [{ mark: '–', revision_record: 'First issue', eci_no: bom.internal_eci_no, revision_date: bom.date }, ...rawRevs]
+    for (let i = 0; i < cfg.rev.max; i++) {
+      const R = cfg.rev.start + i
+      const rev = revs[i]
+      const set = (c, v) => { const cell = ws.getCell(R, c); cell.value = v ?? null; setFont(cell, cfg.font) }
+      const isFirst = rev && (!rev.mark || rev.mark === '–' || rev.mark === '-')
+      set(cfg.rev.mark, rev ? (isFirst ? '-' : rev.mark) : null)
+      set(cfg.rev.rec, rev?.revision_record ?? null)
+      set(cfg.rev.eci, rev?.eci_no ?? null)
+      set(cfg.rev.date, rev?.revision_date ?? null)
+      set(cfg.rev.rsnr, rev?.revisioner ?? null)
+      set(cfg.rev.appr, rev?.approved_by ?? null)
+    }
   }
+}
 
-  // Route row: FM form number (left) | ROUTE text (right)
-  merge(ws, R, 1, R, 6)
-  setCell(ws, R, 1, 'FM-PE30/SSE-007 Rev.01 (14/OCT/14) Approved SSE', {
-    size: 7, border: BORDER_ALL, align: { horizontal: 'left', vertical: 'middle', wrapText: true }
-  })
-  merge(ws, R, 7, R, 25)
-  setCell(ws, R, 7, 'ROUTE :  Production Eng.  →  (Before OTS = 2 months or 1 week after each event)  →  Purchase  →  1 week  →  Plant Admin.  →  1 week  →  Production Eng. (Keep)', {
-    size: 7, border: BORDER_ALL, align: { horizontal: 'left', vertical: 'middle' }
-  })
-  ws.getRow(R).height = 12
+/* ── main export.  `keys` = 'all' | a single key | an array of keys.
+   Multiple keys → ONE workbook with one sheet per key (combined, like PDF). ── */
+export async function exportBomToExcel(bom, keys = 'all') {
+  const isBag = bom.bom_group === 'BAG'
+  const cfg = isBag ? BAG_CFG : HE_CFG
+  const allPages = groupByKey(bom.items ?? [])
 
-  /* ── download ── */
-  const buffer = await wb.xlsx.writeBuffer()
-  const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
-  const url = URL.createObjectURL(blob)
+  // Resolve which key-pages to export.
+  let pages
+  if (keys === 'all') {
+    pages = allPages.length ? [allPages[0]] : []
+  } else {
+    const keyArr = Array.isArray(keys) ? keys.map(String) : [String(keys)]
+    pages = keyArr.map(k => allPages.find(p => p.key === k)).filter(Boolean)
+  }
+  if (!pages.length) pages = allPages.length ? [allPages[0]] : [{ key: '0', rows: [] }]
+
+  // Load the template workbook once.
+  const url = `${import.meta.env?.BASE_URL ?? '/'}${cfg.file}`
+  const buf = await fetch(url).then(r => {
+    if (!r.ok) throw new Error(`template not found: ${url}`)
+    return r.arrayBuffer()
+  })
+  const wb = new ExcelJS.Workbook()
+  await wb.xlsx.load(buf)
+
+  // Fill one (blank) template sheet per key, then drop the leftover sheets.
+  const usedNames = new Set()
+  const n = Math.min(pages.length, wb.worksheets.length)
+  for (let i = 0; i < n; i++) fillSheet(wb.worksheets[i], cfg, bom, pages[i], usedNames)
+  wb.worksheets.slice(n).map(s => s.id).forEach(id => { try { wb.removeWorksheet(id) } catch { /* ignore */ } })
+
+  // Download
+  const out = await wb.xlsx.writeBuffer()
+  const blob = new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
+  const link = URL.createObjectURL(blob)
   const a = document.createElement('a')
-  a.href = url
+  a.href = link
   a.download = `BOM_${bom.tg_part_no ?? bom.id}.xlsx`
   a.click()
-  URL.revokeObjectURL(url)
+  URL.revokeObjectURL(link)
 }

@@ -7,6 +7,9 @@ import { pool, initDb } from './db.js'
 import bomRouter from './routes/bom.js'
 import importRouter from './routes/import.js'
 import approvalRouter from './routes/approval.js'
+import authRouter from './routes/auth.js'
+import presenceRouter from './routes/presence.js'
+import { requireAuth } from './middleware/auth.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -25,8 +28,16 @@ app.get('/api/health', async (_req, res) => {
   }
 })
 
-app.use('/api/bom', bomRouter)
-app.use('/api/import', importRouter)
+// Auth (login is public; user-management endpoints guard themselves)
+app.use('/api/auth', authRouter)
+
+// Protected API — require a valid token
+app.use('/api/bom', requireAuth, bomRouter)
+app.use('/api/import', requireAuth, importRouter)
+app.use('/api/presence', presenceRouter)
+
+// Approval: the public approve page + token submit must stay open (emailed to approvers);
+// only the authenticated "send approval" action is guarded by the BOM UI being behind login.
 app.use('/api/approval', approvalRouter)
 app.use('/approve', approvalRouter)
 

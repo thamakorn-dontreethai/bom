@@ -1,7 +1,17 @@
 import express from 'express'
 import crypto from 'crypto'
+import fs from 'fs'
+import path from 'path'
+import { fileURLToPath } from 'url'
 import nodemailer from 'nodemailer'
 import { pool } from '../db.js'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const APPROVALS_DIR = path.join(__dirname, '../../uploads/approvals')
+if (!fs.existsSync(APPROVALS_DIR)) fs.mkdirSync(APPROVALS_DIR, { recursive: true })
+
+// Add pdf_filename column if not exists
+pool.query(`ALTER TABLE tg.approval_tokens ADD COLUMN IF NOT EXISTS pdf_filename TEXT`).catch(() => {})
 
 const router = express.Router()
 
@@ -52,13 +62,19 @@ router.post('/send', async (req, res) => {
   const bom = bomRows[0]
 
   const token = crypto.randomBytes(32).toString('hex')
-  // Use APP_URL from env if set; otherwise auto-detect from the incoming request
   const appUrl = process.env.APP_URL || `${req.protocol}://${req.get('host')}`
   const link = `${appUrl}/approve/${token}`
 
+  // Save PDF file if provided
+  let pdfFilename = null
+  if (pdfBase64) {
+    pdfFilename = `approval-${token}.pdf`
+    fs.writeFileSync(path.join(APPROVALS_DIR, pdfFilename), Buffer.from(pdfBase64, 'base64'))
+  }
+
   await pool.query(
-    `INSERT INTO tg.approval_tokens (token, bom_id, sent_to) VALUES ($1, $2, $3)`,
-    [token, bomId, recipientEmail]  // bom_id column stores design_spec_id
+    `INSERT INTO tg.approval_tokens (token, bom_id, sent_to, pdf_filename) VALUES ($1, $2, $3, $4)`,
+    [token, bomId, recipientEmail, pdfFilename]
   )
 
   const attachments = pdfBase64 ? [{
@@ -69,19 +85,19 @@ router.post('/send', async (req, res) => {
 
   const html = `
     <div style="font-family:Arial,sans-serif;max-width:600px;margin:auto">
-      <h2 style="color:#1a3a6b">ขออนุมัติ BOM Document</h2>
+      <h2 style="color:#1a3a6b">BOM Document Approval Request</h2>
       <table style="border-collapse:collapse;width:100%">
         <tr><td style="padding:6px;color:#666;width:130px">TGT Part No.</td><td style="padding:6px;font-weight:bold">${bom.tg_part_no ?? '-'}</td></tr>
         <tr><td style="padding:6px;color:#666">Model</td><td style="padding:6px">${bom.model ?? '-'}</td></tr>
         <tr><td style="padding:6px;color:#666">Model Name</td><td style="padding:6px">${bom.model_name ?? '-'}</td></tr>
         <tr><td style="padding:6px;color:#666">ECI No.</td><td style="padding:6px">${bom.internal_eci_no ?? '-'}</td></tr>
       </table>
-      ${pdfBase64 ? `<p style="margin-top:16px;color:#555">📎 เอกสาร BOM แนบมาในรูปแบบ PDF</p>` : ''}
-      <p style="margin-top:24px">กรุณาคลิกปุ่มด้านล่างเพื่อกรอก <b>ชื่อผู้อนุมัติ</b> และยืนยันการอนุมัติเอกสาร BOM นี้</p>
+      ${pdfBase64 ? `<p style="margin-top:16px;color:#555">📎 The BOM document is attached as a PDF</p>` : ''}
+      <p style="margin-top:24px">Please click the button below to enter the <b>approver's name</b> and confirm approval of this BOM document.</p>
       <a href="${link}" style="display:inline-block;margin-top:12px;padding:12px 28px;background:#1a6b3c;color:#fff;text-decoration:none;border-radius:6px;font-size:15px">
-        ✅ อนุมัติเอกสาร BOM
+        ✅ Approve BOM Document
       </a>
-      <p style="margin-top:20px;font-size:12px;color:#999">ลิงก์นี้ใช้ได้ครั้งเดียว · ระบบ BOM Management</p>
+      <p style="margin-top:20px;font-size:12px;color:#999">This link can be used once · BOM Management System</p>
     </div>
   `
 
@@ -89,7 +105,7 @@ router.post('/send', async (req, res) => {
     await mailer().sendMail({
       from:        `"BOM System" <${process.env.SMTP_USER}>`,
       to:          recipientEmail,
-      subject:     `[BOM อนุมัติ] ${bom.tg_part_no ?? ''} — ${bom.model ?? ''}`,
+      subject:     `[BOM Approval] ${bom.tg_part_no ?? ''} — ${bom.model ?? ''}`,
       html,
       attachments,
     })
@@ -98,6 +114,19 @@ router.post('/send', async (req, res) => {
     console.error('Email error:', e.message)
     res.status(500).json({ error: 'send_failed', detail: e.message })
   }
+})
+
+/* ── GET /api/approval/pdf/:token  — Serve stored PDF ── */
+router.get('/pdf/:token', async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT pdf_filename FROM tg.approval_tokens WHERE token = $1 LIMIT 1`, [req.params.token]
+  )
+  if (!rows.length || !rows[0].pdf_filename) return res.status(404).end()
+  const filePath = path.join(APPROVALS_DIR, rows[0].pdf_filename)
+  if (!fs.existsSync(filePath)) return res.status(404).end()
+  res.setHeader('Content-Type', 'application/pdf')
+  res.setHeader('Content-Disposition', 'inline')
+  fs.createReadStream(filePath).pipe(res)
 })
 
 /* ── GET /approve/:token  — Approval page (served as HTML) ── */
@@ -111,7 +140,7 @@ router.get('/:token', async (req, res) => {
      JOIN tg.model m ON m.model_id = ds.model_id
      WHERE at.token = $1 LIMIT 1`, [token]
   )
-  if (!rows.length) return res.status(404).send(errorPage('ไม่พบลิงก์นี้หรือหมดอายุแล้ว'))
+  if (!rows.length) return res.status(404).send(errorPage('This link was not found or has expired'))
 
   const t = rows[0]
   if (t.status === 'approved') return res.send(donePage(t.approved_by, t.approved_at))
@@ -125,19 +154,20 @@ router.get('/:token', async (req, res) => {
      ORDER BY b.sort_order`, [t.bom_id]
   )
 
-  res.send(approvalPage(token, t, items))
+  const appUrl = process.env.APP_URL || `${req.protocol}://${req.get('host')}`
+  res.send(approvalPage(token, t, items, appUrl))
 })
 
 /* ── POST /approve/:token  — Submit approval ── */
 router.post('/:token', express.urlencoded({ extended: false }), async (req, res) => {
   const { token } = req.params
   const approvedBy = (req.body.approved_by ?? '').trim()
-  if (!approvedBy) return res.status(400).send(errorPage('กรุณากรอกชื่อผู้อนุมัติ'))
+  if (!approvedBy) return res.status(400).send(errorPage('Please enter the approver name'))
 
   const { rows } = await pool.query(
     `SELECT * FROM tg.approval_tokens WHERE token = $1 LIMIT 1`, [token]
   )
-  if (!rows.length) return res.status(404).send(errorPage('ไม่พบลิงก์นี้'))
+  if (!rows.length) return res.status(404).send(errorPage('This link was not found'))
   const t = rows[0]
   if (t.status === 'approved') return res.send(donePage(t.approved_by, t.approved_at))
 
@@ -147,21 +177,14 @@ router.post('/:token', express.urlencoded({ extended: false }), async (req, res)
     [approvedBy, token]
   )
 
-  // Update design_spec.approved_by directly (works even without bom_revision rows)
+  // Update design_spec (first row) and all bom_revision rows
   await pool.query(
     `UPDATE tg.design_spec SET approved_by = $1 WHERE design_spec_id = $2`,
     [approvedBy, t.bom_id]
   )
-
-  // Also update latest bom_revision if any rows exist
   await pool.query(
-    `UPDATE tg.bom_revision SET approved_by = $1
-     WHERE design_spec_id = $2
-     AND revision_id = (
-       SELECT revision_id FROM tg.bom_revision
-       WHERE design_spec_id = $2
-       ORDER BY sort_order DESC LIMIT 1
-     )`, [approvedBy, t.bom_id]
+    `UPDATE tg.bom_revision SET approved_by = $1 WHERE design_spec_id = $2`,
+    [approvedBy, t.bom_id]
   )
 
   // Notify any open SSE connections for this BOM
@@ -182,7 +205,7 @@ function layout(body) {
     <style>
       * { box-sizing: border-box; margin: 0; padding: 0 }
       body { font-family: Arial, sans-serif; background: #f4f6f9; min-height: 100vh; display: flex; justify-content: center; padding: 24px }
-      .card { background: #fff; border-radius: 10px; box-shadow: 0 2px 16px rgba(0,0,0,.12); padding: 36px; max-width: 960px; width: 100%; align-self: flex-start }
+      .card { background: #fff; border-radius: 10px; box-shadow: 0 2px 16px rgba(0,0,0,.12); padding: 36px; max-width: 1200px; width: 100%; align-self: flex-start }
       h2 { color: #1a3a6b; margin-bottom: 20px; font-size: 20px }
       .info-row { display: flex; padding: 7px 0; border-bottom: 1px solid #f0f0f0 }
       .info-label { color: #888; width: 150px; font-size: 13px }
@@ -209,7 +232,7 @@ function layout(body) {
   </head><body><div class="card">${body}</div></body></html>`
 }
 
-function approvalPage(token, t, items = []) {
+function approvalPage(token, t, items = [], appUrl = '') {
   const itemRows = items.map(it => {
     const lv = it.level ?? 1
     const spec = [
@@ -229,7 +252,7 @@ function approvalPage(token, t, items = []) {
   }).join('')
 
   return layout(`
-    <h2 style="margin-bottom:16px">✉️ ขออนุมัติ BOM Document</h2>
+    <h2 style="margin-bottom:16px">✉️ BOM Document Approval Request</h2>
 
     <div style="background:#f8f9ff;border:1px solid #dde;border-radius:8px;padding:14px;margin-bottom:24px;display:grid;grid-template-columns:1fr 1fr;gap:0">
       <div class="info-row"><span class="info-label">TGT Part No.</span><span class="info-val">${t.tg_part_no ?? '-'}</span></div>
@@ -238,8 +261,15 @@ function approvalPage(token, t, items = []) {
       <div class="info-row" style="border:none"><span class="info-label">ECI No.</span><span class="info-val">${t.internal_eci_no ?? '-'}</span></div>
     </div>
 
-    ${items.length > 0 ? `
-    <div style="font-size:13px;font-weight:600;margin-bottom:8px;color:#1a3a6b">รายการ BOM (${items.length} รายการ)</div>
+    ${t.pdf_filename ? `
+    <div style="font-size:13px;font-weight:600;margin-bottom:8px;color:#1a3a6b">BOM Document</div>
+    <iframe
+      src="${appUrl}/api/approval/pdf/${token}"
+      style="width:100%;height:680px;border:1px solid #e2e8f0;border-radius:8px;display:block;margin-bottom:16px"
+      title="BOM Document"
+    ></iframe>
+    ` : items.length > 0 ? `
+    <div style="font-size:13px;font-weight:600;margin-bottom:8px;color:#1a3a6b">BOM Items (${items.length} items)</div>
     <div style="overflow-x:auto;margin-bottom:8px">
       <table class="bom-tbl">
         <thead>
@@ -258,23 +288,23 @@ function approvalPage(token, t, items = []) {
 
     <div class="approve-box">
       <form method="POST" action="/approve/${token}">
-        <label style="font-size:14px;font-weight:700;display:block;margin-bottom:8px;color:#1a3a6b">ชื่อผู้อนุมัติ (Approved by)</label>
-        <input type="text" name="approved_by" placeholder="กรอกชื่อ-นามสกุล" required autofocus />
-        <button type="submit">✅ ยืนยันการอนุมัติ</button>
+        <label style="font-size:14px;font-weight:700;display:block;margin-bottom:8px;color:#1a3a6b">Approved by</label>
+        <input type="text" name="approved_by" placeholder="Enter full name" required autofocus />
+        <button type="submit">✅ Confirm Approval</button>
       </form>
-      <p class="note">ลิงก์นี้ใช้ได้ครั้งเดียว</p>
+      <p class="note">This link can be used once</p>
     </div>
   `)
 }
 
 function donePage(name, at) {
-  const d = new Date(at).toLocaleString('th-TH')
+  const d = new Date(at).toLocaleString('en-GB')
   return layout(`
     <div class="success">✅</div>
-    <h2 style="text-align:center">อนุมัติเรียบร้อยแล้ว</h2>
-    <div class="info-row" style="margin-top:16px"><span class="info-label">อนุมัติโดย</span><span class="info-val">${name}</span></div>
-    <div class="info-row"><span class="info-label">วันที่</span><span class="info-val">${d}</span></div>
-    <p class="note" style="margin-top:20px">ระบบได้บันทึกชื่อผู้อนุมัติลงใน BOM แล้ว</p>
+    <h2 style="text-align:center">Approved successfully</h2>
+    <div class="info-row" style="margin-top:16px"><span class="info-label">Approved by</span><span class="info-val">${name}</span></div>
+    <div class="info-row"><span class="info-label">Date</span><span class="info-val">${d}</span></div>
+    <p class="note" style="margin-top:20px">The approver's name has been saved to the BOM.</p>
   `)
 }
 

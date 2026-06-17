@@ -1,4 +1,5 @@
 import pg from 'pg'
+import bcrypt from 'bcryptjs'
 const { Pool } = pg
 
 export const pool = new Pool({
@@ -83,6 +84,92 @@ export async function initDb() {
   // migration_005 — store original PDF file per design_spec
   await pool.query(`ALTER TABLE tg.design_spec ADD COLUMN IF NOT EXISTS pdf_url TEXT`)
 
+  // migration_005b — customer name override for display
+  await pool.query(`ALTER TABLE tg.design_spec ADD COLUMN IF NOT EXISTS customer_name_override TEXT`)
+
+  // migration_005d — BOM group classification
+  await pool.query(`ALTER TABLE tg.design_spec ADD COLUMN IF NOT EXISTS bom_group VARCHAR(50)`)
+
+  // migration_005e — allow bom_level up to 6 (for BAG products)
+  await pool.query(`
+    ALTER TABLE tg.bom DROP CONSTRAINT IF EXISTS bom_bom_level_check
+  `)
+  await pool.query(`
+    ALTER TABLE tg.bom ADD CONSTRAINT bom_bom_level_check CHECK (bom_level BETWEEN 1 AND 6)
+  `)
+
+  // migration_005c — per-revision PDF url
+  await pool.query(`ALTER TABLE tg.bom_revision ADD COLUMN IF NOT EXISTS pdf_url TEXT`)
+
+  // migration_008 — snapshot columns so revised_out rows keep their original part_name/mass_gram
+  // and insert-after rows can store row-level overrides without touching shared tg.part
+  await pool.query(`
+    ALTER TABLE tg.bom
+      ADD COLUMN IF NOT EXISTS snapshot_part_name TEXT,
+      ADD COLUMN IF NOT EXISTS snapshot_mass_gram NUMERIC,
+      ADD COLUMN IF NOT EXISTS snapshot_image_url TEXT
+  `)
+
+  // migration_011 — free-text gate (runner/sprue) weight per BOM row
+  await pool.query(`ALTER TABLE tg.bom ADD COLUMN IF NOT EXISTS gate TEXT`)
+
+  // migration_009 — freeze per-row display values for all existing rows.
+  // COALESCE fills null slots only; existing snapshots are never overwritten.
+  // image_url: restore from tg.part for rows that have no explicit upload yet.
+  // Going forward, new uploads write to snapshot only (tg.part is no longer mutated).
+  await pool.query(`
+    UPDATE tg.bom b
+    SET snapshot_part_name = COALESCE(b.snapshot_part_name, p.part_name),
+        snapshot_mass_gram = COALESCE(b.snapshot_mass_gram, p.mass_gram),
+        snapshot_image_url = COALESCE(b.snapshot_image_url, p.image_url)
+    FROM tg.part p
+    WHERE b.child_part_id = p.part_id
+  `)
+
+  // migration_010 — image upload history per BOM row
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tg.bom_image_history (
+      id          BIGSERIAL PRIMARY KEY,
+      bom_id      BIGINT NOT NULL REFERENCES tg.bom(bom_id) ON DELETE CASCADE,
+      image_url   TEXT NOT NULL,
+      replaced_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `)
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_bom_img_hist_bom
+      ON tg.bom_image_history(bom_id, replaced_at DESC)
+  `)
+
+  // migration_011 — extend history with full data snapshot
+  await pool.query(`
+    ALTER TABLE tg.bom_image_history
+      ADD COLUMN IF NOT EXISTS event_type VARCHAR(30),
+      ADD COLUMN IF NOT EXISTS tg_part_no VARCHAR(100),
+      ADD COLUMN IF NOT EXISTS part_name  TEXT,
+      ADD COLUMN IF NOT EXISTS quantity   NUMERIC,
+      ADD COLUMN IF NOT EXISTS mass_gram  NUMERIC,
+      ADD COLUMN IF NOT EXISTS spec       TEXT
+  `)
+
+  // migration_007 — completion fields on tg.bom
+  await pool.query(`
+    ALTER TABLE tg.bom
+      ADD COLUMN IF NOT EXISTS price_per_pc      NUMERIC(12,4),
+      ADD COLUMN IF NOT EXISTS supplier          VARCHAR(20),
+      ADD COLUMN IF NOT EXISTS lead_time_day     SMALLINT,
+      ADD COLUMN IF NOT EXISTS completion_remark TEXT
+  `)
+
+  // migration_012 — extended completion + Part No. correction
+  await pool.query(`
+    ALTER TABLE tg.bom
+      ADD COLUMN IF NOT EXISTS snapshot_tg_part_no TEXT,
+      ADD COLUMN IF NOT EXISTS material_cost       NUMERIC(12,2),
+      ADD COLUMN IF NOT EXISTS receiver            TEXT,
+      ADD COLUMN IF NOT EXISTS internal_code       TEXT,
+      ADD COLUMN IF NOT EXISTS kanban_qty          TEXT
+  `)
+
   // migration_003 — approval tokens
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tg.approval_tokens (
@@ -96,6 +183,70 @@ export async function initDb() {
       status      VARCHAR(20) DEFAULT 'pending'
     )
   `)
+
+  // migration_006 — users table
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tg.users (
+      id            BIGSERIAL PRIMARY KEY,
+      username      VARCHAR(50) UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      role          VARCHAR(20) NOT NULL DEFAULT 'purchase',
+      created_at    TIMESTAMPTZ DEFAULT NOW()
+    )
+  `)
+  // migration_013 — full name for users
+  await pool.query(`ALTER TABLE tg.users ADD COLUMN IF NOT EXISTS full_name VARCHAR(120)`)
+
+  // migration_014 — editable Model Name override on design_spec
+  await pool.query(`ALTER TABLE tg.design_spec ADD COLUMN IF NOT EXISTS model_name_override VARCHAR(150)`)
+
+  // migration_015 — audit: who created / last edited each BOM
+  await pool.query(`
+    ALTER TABLE tg.design_spec
+      ADD COLUMN IF NOT EXISTS created_by VARCHAR(120),
+      ADD COLUMN IF NOT EXISTS updated_by VARCHAR(120),
+      ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ
+  `)
+
+  // migration_016 — saved "Part No. views": a filtered subset of a BOM under a given key
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tg.bom_view (
+      id             BIGSERIAL PRIMARY KEY,
+      design_spec_id BIGINT NOT NULL REFERENCES tg.design_spec(design_spec_id) ON DELETE CASCADE,
+      key_code       VARCHAR(20),
+      name           VARCHAR(150) NOT NULL,
+      part_nos       TEXT[] NOT NULL DEFAULT '{}',
+      created_by     VARCHAR(120),
+      created_at     TIMESTAMPTZ DEFAULT NOW()
+    )
+  `)
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_bom_view_ds ON tg.bom_view(design_spec_id)`)
+
+  // migration_017 — activity log (admin timeline): login / import / delete etc.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tg.activity_log (
+      id         BIGSERIAL PRIMARY KEY,
+      user_name  VARCHAR(120),
+      action     VARCHAR(40) NOT NULL,
+      target     TEXT,
+      detail     TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `)
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_activity_created ON tg.activity_log(created_at DESC)`)
+
+  // Seed a default admin if no admin exists yet (admin/admin1234)
+  const { rows: adminRows } = await pool.query("SELECT COUNT(*) AS cnt FROM tg.users WHERE role='admin'")
+  if (parseInt(adminRows[0].cnt) === 0) {
+    const adminHash = await bcrypt.hash('admin1234', 10)
+    await pool.query(
+      `INSERT INTO tg.users (username, password_hash, role, full_name)
+       VALUES ('admin', $1, 'admin', 'Administrator')
+       ON CONFLICT (username) DO UPDATE SET role='admin'`,
+      [adminHash]
+    )
+    console.log('Default admin created: admin / admin1234')
+  }
 
   const { rows } = await pool.query('SELECT COUNT(*) AS cnt FROM tg.bom')
   if (parseInt(rows[0].cnt) === 0) {
@@ -132,7 +283,7 @@ async function seedBom() {
   const { rows: dsRows } = await pool.query(
     "SELECT design_spec_id FROM tg.design_spec WHERE internal_eci_no = '26A376' LIMIT 1"
   )
-  if (!dsRows.length) throw new Error('design_spec not found – run the schema SQL first')
+  if (!dsRows.length) { console.log('Seed skipped: no design_spec found (import a PDF to create BOM data)'); return }
   const dsId = dsRows[0].design_spec_id
 
   const { rows: v1Rows } = await pool.query(
