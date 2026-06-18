@@ -1,7 +1,7 @@
 import { useRef, useState, useEffect } from 'react'
 import jsPDF from 'jspdf'
 import html2canvas from 'html2canvas'
-import { exportBomToExcel } from '../utils/exportBomExcel'
+import { exportBomToExcel, exportBomMatrix } from '../utils/exportBomExcel'
 import { getUser } from '../auth'
 
 // Logged-in user's display name — used to pre-fill Revisioner fields
@@ -147,7 +147,7 @@ function groupByKey(items) {
   })
 }
 
-function Cols({ maxLevel = 5 }) {
+function Cols({ maxLevel = 5 }) { 
   const pnCols = Array(maxLevel).fill(85)
   return (
     <colgroup>
@@ -489,7 +489,7 @@ export default function BomDocumentView({ bom, onRefresh }) {
   function openExport(mode) {
     if (busy || saving) return
     if (pages.length <= 1) {
-      if (mode === 'excel') exportBomToExcel(bom, 'all')
+      if (mode === 'excel') exportBomToExcel(bom, 'all', activeView)
       else if (mode === 'pdf') download()
       else printDoc()
       return
@@ -505,7 +505,7 @@ export default function BomDocumentView({ bom, onRefresh }) {
     const mode = exportMode
     setExportMode(null)
     if (!sel.length) return
-    if (mode === 'excel') exportBomToExcel(bom, sel.map(i => pages[i].key))
+    if (mode === 'excel') exportBomToExcel(bom, sel.map(i => pages[i].key), activeView)
     else if (mode === 'pdf') download(sel)
     else printDoc(sel)
   }
@@ -612,6 +612,12 @@ export default function BomDocumentView({ bom, onRefresh }) {
             <rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/><line x1="9" y1="3" x2="9" y2="21"/><line x1="15" y1="3" x2="15" y2="21"/>
           </svg>
           Excel
+        </button>
+        <button className="bdv-btn bdv-btn--matrix" onClick={() => exportBomMatrix(bom)} disabled={busy || saving} title="Export Matrix Component Part Detail">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/>
+          </svg>
+          Matrix
         </button>
         <button className="bdv-btn bdv-btn--print" onClick={() => openExport('print')} disabled={busy || saving} title="Print">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -1344,7 +1350,7 @@ function Chk({ checked, onChange }) {
 }
 
 /* ── single BOM row with revision history support ── */
-function BomRow({ row, maxLevel = 5 }) {
+function BomRow({ row, maxLevel = 5, isBag = false }) {
   const levelCols = Array.from({ length: maxLevel }, (_, i) => i + 1)
   if (!row) return (
     <tr className="bp-row-empty">
@@ -1403,8 +1409,9 @@ function BomRow({ row, maxLevel = 5 }) {
     )
   }
 
-  // _skipCustPn: customer_pn was already injected as a header row above the struck rows
-  const hasCustPn = lv === 1 && !!row.customer_part_no && !isRevisedOut && !row._skipCustPn
+  // _skipCustPn: customer_pn was already injected as a header row above the struck rows.
+  // BAG BOMs show ONLY the FG (TG) Part No. on Level 1 — no separate customer_pn line.
+  const hasCustPn = lv === 1 && !!row.customer_part_no && !isRevisedOut && !row._skipCustPn && !isBag
   const trClass = `bp-row bp-row-lv${lv}${isRevisedOut ? ' bp-row-revised-out' : ''}`
 
   return (

@@ -1449,6 +1449,12 @@ body {
 }
 .bdv-btn--excel:hover:not(:disabled) { background: #f0fdf4; border-color: #86efac; color: #15803d; }
 
+/* ghost + indigo hover — Matrix */
+.bdv-btn--matrix {
+  background: #fff; color: #374151; border-color: #d1d5db;
+}
+.bdv-btn--matrix:hover:not(:disabled) { background: #eef2ff; border-color: #a5b4fc; color: #4338ca; }
+
 /* ghost — Print */
 .bdv-btn--print {
   background: #fff; color: #374151; border-color: #d1d5db;

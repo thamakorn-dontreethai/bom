@@ -275,9 +275,258 @@ function fillSheet(ws, cfg, bom, page, usedNames) {
   }
 }
 
+/* ── fetch image URL → base64 string (null if unavailable) ── */
+async function fetchImgBase64(url) {
+  if (!url) return null
+  try {
+    const res = await fetch(url)
+    if (!res.ok) return null
+    const blob = await res.blob()
+    return new Promise(resolve => {
+      const reader = new FileReader()
+      reader.onload  = () => { const r = reader.result; resolve(r.includes(',') ? r.split(',')[1] : r) }
+      reader.onerror = () => resolve(null)
+      reader.readAsDataURL(blob)
+    })
+  } catch { return null }
+}
+
+/* ── Matrix export: Component Part Detail ──────────────────────────────────
+   Matches the "581D COMPONENT PART DETAIL" document format exactly:
+
+   Rows 1-2 : Title (left) + Approval block 7 cols (right)
+   Rows 3-6 : Component header block
+     · A-D : merged vertically (rows 3-6) — column stub labels
+     · E-G : merged horizontally per row  — type label (CUSTOMER PART NO. etc.)
+     · H+  : one col per component, values per label type per row
+   Rows 7+  : Assembly data rows
+     A=NO.  B=MODEL  C=INT.CODE  D=Type  E=PICTURES  F=INTERNAL PART NO.  G=PART NAME  H+=qty
+   Bottom   : Revision record
+   ─────────────────────────────────────────────────────────────────────── */
+export async function exportBomMatrix(bom) {
+  const items = (bom.items ?? []).filter(it => it.status !== 'revised_out')
+
+  // Collect unique keys
+  const allKeySet = new Set()
+  items.forEach(it => parseKeyList(it.key_code).forEach(k => allKeySet.add(String(k))))
+  const allKeys = [...allKeySet].sort((a, b) => Number(a) - Number(b))
+
+  // Build assembly rows (one per key)
+  const assemblyRows = (allKeys.length ? allKeys : ['0']).map(key => {
+    const keyItems = items.filter(it => {
+      const ks = parseKeyList(it.key_code)
+      return ks.length === 0 || ks.map(String).includes(key)
+    })
+    return {
+      key,
+      assembly:   keyItems.find(it => (it.level ?? 1) === 1) ?? null,
+      // Level 2 only = direct sub-components of the assembly (same as 581D template)
+      components: keyItems.filter(it => (it.level ?? 1) === 2),
+    }
+  })
+
+  // Unique component columns (dedup by tg_part_no, preserve first-seen order)
+  const compMap = new Map()
+  assemblyRows.forEach(a => a.components.forEach(c => {
+    const pn = c.tg_part_no ?? c.customer_part_no
+    if (pn && !compMap.has(pn)) compMap.set(pn, c)
+  }))
+  const compCols = [...compMap.values()]
+
+  // Quantity lookup: `${key}__${partNo}` → qty
+  const qtyMap = {}
+  assemblyRows.forEach(a => a.components.forEach(c => {
+    const pn = c.tg_part_no ?? c.customer_part_no
+    if (pn) qtyMap[`${a.key}__${pn}`] = c.quantity ?? 1
+  }))
+
+  // ── workbook setup ──
+  const wb = new ExcelJS.Workbook()
+  const ws = wb.addWorksheet('Component Part Detail', { pageSetup: { orientation: 'landscape', paperSize: 8 } })
+
+  // LEFT = 7 fixed cols (A–G); component cols start at H (col 8)
+  const LEFT  = 7
+  // Ensure at least 7 component-width cols so approval block doesn't crowd title
+  const COMP_COLS_COUNT = Math.max(compCols.length, 7)
+  const TOTAL = LEFT + COMP_COLS_COUNT
+
+  // Column widths
+  ws.getColumn(1).width = 5   // A  NO.
+  ws.getColumn(2).width = 8   // B  MODEL
+  ws.getColumn(3).width = 10  // C  INT.CODE
+  ws.getColumn(4).width = 6   // D  Type
+  ws.getColumn(5).width = 14  // E  PICTURES
+  ws.getColumn(6).width = 22  // F  INTERNAL PART NO.
+  ws.getColumn(7).width = 24  // G  PART NAME
+  for (let i = 0; i < COMP_COLS_COUNT; i++) ws.getColumn(LEFT + 1 + i).width = 15
+
+  // ── cell helper ──
+  const BD    = { style: 'thin', color: { argb: 'FF000000' } }
+  const ALLBD = { top: BD, left: BD, bottom: BD, right: BD }
+  function cell(r, col, value, { bold = false, sz = 9, align = 'center', wrap = true, italic = false, bg } = {}) {
+    const ce = ws.getCell(r, col)
+    ce.value     = value
+    ce.font      = { name: 'Tahoma', size: sz, bold, italic }
+    ce.alignment = { horizontal: align, vertical: 'middle', wrapText: wrap }
+    ce.border    = ALLBD
+    if (bg) ce.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: bg } }
+    return ce
+  }
+  function merge(r1, c1, r2, c2) { try { ws.mergeCells(r1, c1, r2, c2) } catch { /* overlap ok */ } }
+
+  // ────────────────────────────────────────────────────────────────────────
+  // ROWS 1–2 : Title + Approval block
+  // ────────────────────────────────────────────────────────────────────────
+  const APPR_START = TOTAL - 6   // rightmost 7 cols = approval block
+  const TITLE_END  = APPR_START - 1
+
+  // Title (A1 : TITLE_END row 1-2 merged vertically)
+  merge(1, 1, 2, TITLE_END)
+  cell(1, 1, `${bom.model ?? ''} COMPONENT PART DETAIL`, { bold: true, sz: 13 })
+  ws.getRow(1).height = 18
+  ws.getRow(2).height = 18
+
+  // Approval block top row (role labels)
+  const apprTop    = ['PEB',   'PD',    'QA',    'QE',    '',        'PE',    ''     ]
+  const apprBottom = ['CHECK', 'CHECK', 'CHECK', 'CHECK', 'APPROVE', 'CHECK', 'ISSUE']
+  apprTop.forEach((v, i)    => cell(1, APPR_START + i, v,    { bold: true, sz: 8 }))
+  apprBottom.forEach((v, i) => cell(2, APPR_START + i, v,    { bold: true, sz: 8 }))
+
+  // ────────────────────────────────────────────────────────────────────────
+  // ROWS 3–6 : Component column header block
+  // ────────────────────────────────────────────────────────────────────────
+  //  A3:A6 merged = "NO."      B3:B6 = "MODEL"   C3:C6 = "INT.\nCODE"   D3:D6 = "Type"
+  //  E3:G3 merged = "CUSTOMER PART NO."
+  //  E4:G4 merged = "INTERNAL PART NO."
+  //  E5:G5 merged = "PART NAME"
+  //  E6:G6 merged = "PICTURES"
+  //  H3+  = component customer part nos  …  H4+ = tg part nos  …  H5+ = names  …  H6+ = pics
+
+  // Merged vertical column stubs A-D
+  const COL_STUBS = ['NO.', 'MODEL', 'INT.\nCODE', 'Type']
+  COL_STUBS.forEach((label, i) => {
+    merge(3, i + 1, 6, i + 1)
+    cell(3, i + 1, label, { bold: true, sz: 8 })
+  })
+  ws.getRow(3).height = 14
+  ws.getRow(4).height = 14
+  ws.getRow(5).height = 14
+  ws.getRow(6).height = 65  // tall for pictures
+
+  // Type-label column (E:G merged horizontally per row)
+  const TYPE_LABELS = ['CUSTOMER PART NO.', 'INTERNAL PART NO.', 'PART NAME', 'PICTURES']
+  TYPE_LABELS.forEach((label, hi) => {
+    merge(3 + hi, 5, 3 + hi, 7)
+    cell(3 + hi, 5, label, { bold: true, sz: 8, align: 'right' })
+  })
+
+  // Component data cells in rows 3-6
+  compCols.forEach((comp, ci) => {
+    const col = LEFT + 1 + ci
+    const vals = [
+      comp.customer_part_no ?? comp.tg_part_no ?? '',
+      comp.tg_part_no ?? '',
+      comp.part_name ?? '',
+      '',  // images handled below
+    ]
+    vals.forEach((v, hi) => cell(3 + hi, col, v, { sz: 8 }))
+  })
+
+  // Empty cells for padding columns (if compCols.length < COMP_COLS_COUNT)
+  for (let ci = compCols.length; ci < COMP_COLS_COUNT; ci++) {
+    const col = LEFT + 1 + ci
+    for (let hi = 0; hi < 4; hi++) cell(3 + hi, col, '')
+  }
+
+  // Component images in row 6 (0-indexed row 5)
+  for (let ci = 0; ci < compCols.length; ci++) {
+    const b64 = await fetchImgBase64(compCols[ci].image_url)
+    if (!b64) continue
+    const ext = (compCols[ci].image_url ?? '').toLowerCase().endsWith('.png') ? 'png' : 'jpeg'
+    ws.addImage(wb.addImage({ base64: b64, extension: ext }),
+      { tl: { col: LEFT + ci, row: 5 }, br: { col: LEFT + ci + 1, row: 6 } })
+  }
+
+  // ────────────────────────────────────────────────────────────────────────
+  // ROWS 7+ : Assembly data rows
+  // ────────────────────────────────────────────────────────────────────────
+  const DATA_START = 7
+
+  for (let ai = 0; ai < assemblyRows.length; ai++) {
+    const { key, assembly } = assemblyRows[ai]
+    const R = DATA_START + ai
+    ws.getRow(R).height = 55
+
+    cell(R, 1, ai + 1,                          { sz: 9 })
+    cell(R, 2, bom.model ?? '',                  { sz: 9 })
+    cell(R, 3, key,                              { sz: 9 })
+    cell(R, 4, '-',                              { sz: 9 })
+    cell(R, 5, '',                               { sz: 9 })   // PICTURES placeholder
+    cell(R, 6, assembly?.tg_part_no ?? '',       { sz: 9, align: 'left' })
+    cell(R, 7, assembly?.part_name  ?? '',       { sz: 9, align: 'left' })
+
+    // Assembly image in col E (col 5 = 1-indexed → 0-indexed col 4)
+    const ab64 = await fetchImgBase64(assembly?.image_url)
+    if (ab64) {
+      const ext = (assembly.image_url ?? '').toLowerCase().endsWith('.png') ? 'png' : 'jpeg'
+      ws.addImage(wb.addImage({ base64: ab64, extension: ext }),
+        { tl: { col: 4, row: R - 1 }, br: { col: 5, row: R } })
+    }
+
+    // Quantities (or '-') for each component column
+    for (let ci = 0; ci < COMP_COLS_COUNT; ci++) {
+      const comp = compCols[ci]
+      const col  = LEFT + 1 + ci
+      if (!comp) { cell(R, col, ''); continue }
+      const pn  = comp.tg_part_no ?? comp.customer_part_no
+      const qty = qtyMap[`${key}__${pn}`]
+      cell(R, col, qty != null ? qty : '-', { sz: 9 })
+    }
+  }
+
+  // ────────────────────────────────────────────────────────────────────────
+  // Revision record (bottom)
+  // ────────────────────────────────────────────────────────────────────────
+  const REVSTART = DATA_START + assemblyRows.length + 1
+  const rawRevs  = bom.revisions ?? []
+  const hasFirst = rawRevs.some(r => !r.mark || r.mark === '–' || r.mark === '-')
+  const revs     = hasFirst
+    ? rawRevs
+    : [{ mark: '-', revision_record: 'First Issue', eci_no: bom.internal_eci_no, revision_date: bom.date }, ...rawRevs]
+
+  // Header: No. | DATE | ECI | DETAIL (D:G merged) | Issue | PE CHECK (SUP) | QA | PEB
+  const REV_DETAIL_END = 7
+  merge(REVSTART, 4, REVSTART, REV_DETAIL_END)
+  ;[[1,'No.'],[2,'DATE'],[3,'ECI'],[4,'DETAIL'],[8,'Issue'],[9,'PE CHECK (SUP)'],[10,'QA'],[11,'PEB']]
+    .forEach(([col, h]) => cell(REVSTART, col, h, { bold: true, sz: 8 }))
+  ws.getRow(REVSTART).height = 14
+
+  revs.forEach((rev, i) => {
+    const R = REVSTART + 1 + i
+    const isFirst = !rev.mark || rev.mark === '–' || rev.mark === '-'
+    ws.getRow(R).height = 14
+    cell(R, 1, isFirst ? '-' : rev.mark,   { sz: 9 })
+    cell(R, 2, rev.revision_date ?? '',    { sz: 9 })
+    cell(R, 3, rev.eci_no ?? '',           { sz: 9 })
+    merge(R, 4, R, REV_DETAIL_END)
+    cell(R, 4, rev.revision_record ?? '',  { sz: 9, align: 'left' })
+    cell(R, 8, '',                         { sz: 9 })   // Issue (blank placeholder)
+    cell(R, 9, rev.revisioner ?? '',       { sz: 9 })
+    cell(R, 10, '',                        { sz: 9 })   // QA
+    cell(R, 11, rev.approved_by ?? '',     { sz: 9 })   // PEB
+  })
+
+  // ── download ──
+  const buf  = await wb.xlsx.writeBuffer()
+  const blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
+  const url  = URL.createObjectURL(blob)
+  Object.assign(document.createElement('a'), { href: url, download: `Matrix_${bom.model ?? bom.id}.xlsx` }).click()
+  URL.revokeObjectURL(url)
+}
+
 /* ── main export.  `keys` = 'all' | a single key | an array of keys.
    Multiple keys → ONE workbook with one sheet per key (combined, like PDF). ── */
-export async function exportBomToExcel(bom, keys = 'all') {
+export async function exportBomToExcel(bom, keys = 'all', view = null) {
   const isBag = bom.bom_group === 'BAG'
   const cfg = isBag ? BAG_CFG : HE_CFG
   const allPages = groupByKey(bom.items ?? [])
@@ -291,6 +540,28 @@ export async function exportBomToExcel(bom, keys = 'all') {
     pages = keyArr.map(k => allPages.find(p => p.key === k)).filter(Boolean)
   }
   if (!pages.length) pages = allPages.length ? [allPages[0]] : [{ key: '0', rows: [] }]
+
+  // Apply the active Part No. view filter (same rule as the document view): keep rows whose
+  // Part No. CONTAINS any pattern, plus all their descendants. Only affects the view's own key.
+  if (view?.part_nos?.length) {
+    const pats = view.part_nos.map(p => p.toLowerCase())
+    pages = pages.map(pg => {
+      if (String(view.key_code ?? '') !== String(pg.key)) return pg
+      const rows = (pg.rows ?? []).filter(Boolean)
+      const matches = r => pats.some(p =>
+        (r.tg_part_no ?? '').toLowerCase().includes(p) ||
+        (r.customer_part_no ?? '').toLowerCase().includes(p))
+      const byId = new Map(rows.map(r => [r.id, r]))
+      const keep = new Set()
+      rows.forEach(r => { if (matches(r)) keep.add(r.id) })
+      rows.forEach(r => {
+        if (keep.has(r.id)) return
+        let p = r.parent_id
+        while (p != null) { if (keep.has(p)) { keep.add(r.id); break } p = byId.get(p)?.parent_id ?? null }
+      })
+      return { ...pg, rows: rows.filter(r => keep.has(r.id)) }
+    })
+  }
 
   // Load the template workbook once.
   const url = `${import.meta.env?.BASE_URL ?? '/'}${cfg.file}`
