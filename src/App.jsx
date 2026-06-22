@@ -178,6 +178,10 @@ export default function App() {
   const [showChangePw, setShowChangePw] = useState(false)
   const [filterGroup, setFilterGroup] = useState('All')
   const [uploadGroup, setUploadGroup] = useState(BOM_GROUPS[0])
+  const [showPasteModal, setShowPasteModal] = useState(false)
+  const [pasteText, setPasteText] = useState('')
+  const [pasteUploading, setPasteUploading] = useState(false)
+  const [pasteError, setPasteError] = useState(null)
   const fileRef = useRef(null)
 
   // Let the fetch-auth patch force logout on 401
@@ -311,6 +315,29 @@ export default function App() {
       setErrorInfo({ title: 'Error', message: e.message || 'Could not connect to the server.' })
     }
     finally { setUploading(false) }
+  }
+
+  async function handlePasteText() {
+    if (!pasteText.trim()) { setPasteError('Please paste some DSI text first.'); return }
+    setPasteUploading(true); setPasteError(null)
+    try {
+      const r = await fetch('/api/import/text', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: pasteText, bom_group: uploadGroup }),
+      })
+      let data
+      try { data = await r.json() } catch { data = {} }
+      if (!r.ok) { setPasteError(data.error || data.message || `Server error (${r.status})`); return }
+      setShowPasteModal(false); setPasteText('')
+      await loadList()
+      setSaveMsg(true); setTimeout(() => setSaveMsg(false), 4000)
+      await selectBom(data.design_spec_id)
+    } catch (e) {
+      setPasteError(e.message || 'Could not connect to server.')
+    } finally {
+      setPasteUploading(false)
+    }
   }
 
   async function deleteBom(id) {
@@ -452,6 +479,13 @@ export default function App() {
               <div className="home-dropzone-hint">Supports .pdf files only · Max 100 MB</div>
             </div>
           )}
+          <button className="home-paste-btn" onClick={() => { setPasteText(''); setPasteError(null); setShowPasteModal(true) }}>
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/>
+              <rect x="8" y="2" width="8" height="4" rx="1" ry="1"/>
+            </svg>
+            Paste DSI Text
+          </button>
             </div>{/* /home-hero-right */}
           </div>{/* /home-hero-grid */}
         </div>
@@ -612,6 +646,50 @@ export default function App() {
       )}
 
       {uploading && <ImportProgress />}
+
+      {showPasteModal && (
+        <div className="paste-overlay" onClick={() => setShowPasteModal(false)}>
+          <div className="paste-modal" onClick={e => e.stopPropagation()}>
+            <div className="paste-modal-header">
+              <span>Paste DSI Text</span>
+              <button className="comp-dialog-close" onClick={() => setShowPasteModal(false)}>✕</button>
+            </div>
+            <div className="paste-modal-body">
+              <div className="paste-modal-hint">
+                Open the DSI document, select all text (Ctrl+A), copy (Ctrl+C), then paste below.
+              </div>
+              <div className="paste-modal-group-row">
+                <span className="paste-modal-group-label">BOM Group:</span>
+                {BOM_GROUPS.map(g => (
+                  <button key={g}
+                    className={`home-group-btn${uploadGroup === g ? ' active' : ''}`}
+                    onClick={() => setUploadGroup(g)}>
+                    {g}
+                  </button>
+                ))}
+              </div>
+              <textarea
+                className="paste-modal-textarea"
+                placeholder="Paste DSI text here..."
+                value={pasteText}
+                onChange={e => setPasteText(e.target.value)}
+                spellCheck={false}
+                autoFocus
+              />
+              {pasteError && <div className="paste-modal-error">{pasteError}</div>}
+            </div>
+            <div className="paste-modal-footer">
+              <button className="bdv-btn bdv-btn--secondary" onClick={() => setShowPasteModal(false)}>Cancel</button>
+              <button
+                className="bdv-btn bdv-btn--primary"
+                onClick={handlePasteText}
+                disabled={pasteUploading || !pasteText.trim()}>
+                {pasteUploading ? 'Importing…' : 'Import BOM'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {errorInfo && (
         <div className="comp-overlay" onClick={() => setErrorInfo(null)}>

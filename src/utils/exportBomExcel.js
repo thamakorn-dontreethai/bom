@@ -392,15 +392,6 @@ export async function exportBomMatrix(bom) {
   apprTop.forEach((v, i)    => cell(1, APPR_START + i, v,    { bold: true, sz: 8 }))
   apprBottom.forEach((v, i) => cell(2, APPR_START + i, v,    { bold: true, sz: 8 }))
 
-  // ────────────────────────────────────────────────────────────────────────
-  // ROWS 3–6 : Component column header block
-  // ────────────────────────────────────────────────────────────────────────
-  //  A3:A6 merged = "NO."      B3:B6 = "MODEL"   C3:C6 = "INT.\nCODE"   D3:D6 = "Type"
-  //  E3:G3 merged = "CUSTOMER PART NO."
-  //  E4:G4 merged = "INTERNAL PART NO."
-  //  E5:G5 merged = "PART NAME"
-  //  E6:G6 merged = "PICTURES"
-  //  H3+  = component customer part nos  …  H4+ = tg part nos  …  H5+ = names  …  H6+ = pics
 
   // Merged vertical column stubs A-D
   const COL_STUBS = ['NO.', 'MODEL', 'INT.\nCODE', 'Type']
@@ -480,7 +471,8 @@ export async function exportBomMatrix(bom) {
       if (!comp) { cell(R, col, ''); continue }
       const pn  = comp.tg_part_no ?? comp.customer_part_no
       const qty = qtyMap[`${key}__${pn}`]
-      cell(R, col, qty != null ? qty : '-', { sz: 9 })
+      const qtyDisplay = qty != null ? (Number(qty) % 1 === 0 ? Number(qty) : qty) : '-'
+      cell(R, col, qtyDisplay, { sz: 9 })
     }
   }
 

@@ -19,6 +19,58 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 30 
 
 // ── Text-based DSI PDF parser ─────────────────────────────────────────────────
 
+// Header parser for SPACE-separated text (copy-pasted from a PDF viewer).
+// The existing parseHeader() works with \t-separated text from pdf-parse.
+// This handles: "3GJ 78500-3DA-J110-M1 3:SPECIAL ORDER C None 2026/02/02"
+function parsePastedHeader(text) {
+  const lines = text.split('\n')
+  let model = 'UNKNOWN', customerPartNo = null, tgPartNo = null, productionLevel = null
+  let initialStage = null, regCertif = null, date = null
+  let customerCode = 'UNKNOWN', customerStandards = null, tgStandards = null, internalEciNo = null
+
+  for (const raw of lines) {
+    const t = raw.trim()
+
+    // Model line: "3GJ 78500-3DA -J110-M1 3:SPECIAL ORDER C None 2026/02/02"
+    if (model === 'UNKNOWN' && /^[0-9][A-Z0-9]{2,4}\s+/.test(t)) {
+      const mM = t.match(/^([0-9][A-Z0-9]{2,4})\s+(.+)/)
+      if (mM) {
+        model = mM[1]
+        const rest = mM[2]
+        const prodIdx = rest.search(/\b\d:/)
+        if (prodIdx > 0) {
+          customerPartNo = rest.slice(0, prodIdx).replace(/\s+/g, '').trim() || null
+          const tokens = rest.slice(prodIdx).split(/\s+/).filter(Boolean)
+          if (/^\d{4}\/\d{2}\/\d{2}$/.test(tokens.at(-1))) date = tokens.pop()
+          if (tokens.length) regCertif = tokens.pop()
+          if (tokens.length && /^[A-Z]$/.test(tokens.at(-1))) initialStage = tokens.pop()
+          productionLevel = tokens.join(' ')
+        }
+      }
+    }
+
+    // Customer line: "6991 78500-DA000-6*** IN DRAWING NO 26A376"
+    if (customerCode === 'UNKNOWN' && /^\d{4}\s+/.test(t)) {
+      const tokens = t.split(/\s+/).filter(Boolean)
+      customerCode = tokens[0]
+      if (tokens.length > 1) tgPartNo = tokens[1].replace(/\s+/g, '') || null
+      const last = tokens.at(-1) ?? ''
+      if (/^[0-9]{2}[A-Z][0-9]{3,5}[A-Z]?$/.test(last)) internalEciNo = last
+      const middle = tokens.slice(2, internalEciNo ? -1 : undefined).join(' ')
+      const sm = middle.match(/^(IN DRAWING|NO|YES|N\/A)(?:\s+(IN DRAWING|NO|YES|N\/A))?/)
+      if (sm) { customerStandards = sm[1]; tgStandards = sm[2] ?? null }
+    }
+  }
+
+  return {
+    model, customer_part_no: customerPartNo, tg_part_no: tgPartNo,
+    production_level: productionLevel, initial_stage: initialStage,
+    reg_certif: regCertif, date, customer_code: customerCode,
+    customer_standards: customerStandards, tg_standards: tgStandards,
+    internal_eci_no: internalEciNo,
+  }
+}
+
 function cleanPn(s) {
   return s ? s.replace(/\s+/g, '').trim() || null : null
 }
@@ -60,7 +112,7 @@ function parseHeader(text) {
 
 // BOM row start: optional ">>> ", key (digits/commas/dashes), space, level 1-6,
 // optional customer pn after a tab OR space (e.g. "1 1\t78500-..." or "1 1 78950-30A -T810-M1")
-const ROW_START = /^(>>>\s+)?([0-9][0-9,\-]*)\s+([1-6])(?:\s+(.+))?$/
+const ROW_START = /^(>>>\s+)?([0-9][0-9,-]*)\s+([1-6])(?:\s+(.+))?$/
 
 // Material sub-row: starts with a material number like "4-68403-00000" or "9-78301-C1001".
 // These describe the material of the part above them — not part of the part name.
@@ -85,9 +137,189 @@ function isSkip(raw) {
     || /https?:\/\//.test(t) || /gt-214\/servlet/.test(t)            // footer reference URL
     || /^\d{4}\/\d{2}\/\d{2}\s*$/.test(t)                            // footer date like 2023/02/20
     || t === '>>>'                                                   // "new TG Part No." marker
+    // ── Space-format pasted-text page headers (no tabs) ──────────────
+    // Column header line: "Model Customer Part No. Production Level Initial Stage Control Rank REG/CERTIF Date"
+    || /\bREG\/CERTIF\b/.test(t)
+    // Model data line: "581D 739H0-0K020-C000 4:MASS PRODUCTION C Yes 2026/04/27"
+    || /\b\d:(?:MASS PRODUCTION|SPECIAL ORDER|TRIAL PRODUCTION|ENGINEERING TRIAL)\b/i.test(t)
+    // Customer data line: "0100 739H0-0K020-C*** IN DRAWING NO 26C802"
+    || /^\d{4}\s+[A-Z0-9]{3,6}-[A-Z0-9-]{4,}/.test(t)
+    // Column header lines (space format, no leading tab)
+    || /^Customer\s+TG\s+Part/i.test(t)
+    || /^Part\s+Name\s+Product/i.test(t)
+    || /^Use\s*[#:]/.test(t)
+    || /^Portion\s+Color/i.test(t)
 }
 
-function parseBomItems(text) {
+// Expanded-format parser: handles PDFs copy-pasted from viewers that put each column
+// value on its own line instead of tab-separated.  Structure per item:
+//   isolated KEY number, blanks, isolated LEVEL digit (1-6), blanks,
+//   optional customer PN, TG PN, QTY, "X-Y mass" level-code line, part name…
+function parseBomItemsExpanded(text) {
+  const rawLines = text.split('\n')
+  const lines = rawLines.map(l => l.trim())
+  const items = []
+  let i = 0
+
+  // Extract a PN from a single line, or return null if the line is not a PN.
+  const tryPN = (ln) => {
+    if (!ln) return null
+    const t = ln.replace(/^[%*\s]+/, '').replace(/[\s*]+$/, '')
+    if (!t) return null
+    const tok = t.split(/\s+/)[0]
+    if (/^\d+$/.test(tok)) return null
+    if (/^\d+-\d+$/.test(tok)) return null
+    if (/^\d+-\d+\s+[\d.]/.test(t)) return null
+    const dashes = (tok.match(/-/g) || []).length
+    if (dashes >= 1 && (/[A-Za-z]/.test(tok) || dashes >= 2)) return tok.replace(/\s+/g, '')
+    return null
+  }
+
+  while (i < lines.length) {
+    if (!lines[i] || isSkip(rawLines[i]) || /^\s*#/.test(lines[i])) { i++; continue }
+
+    // Look for KEY: isolated number or composite (e.g. "1", "1-6", "1,2,3")
+    const keyM = lines[i].match(/^([0-9][0-9,-]*)$/)
+    if (!keyM) { i++; continue }
+
+    const key = keyM[1]
+    const keyIdx = i
+    i++
+
+    // Skip blanks between key and level
+    while (i < lines.length && !lines[i]) i++
+    if (i >= lines.length) break
+
+    // Level: isolated single digit 1-6 must immediately follow (with only blanks between)
+    const levelM = lines[i].match(/^([1-6])$/)
+    if (!levelM) { i = keyIdx + 1; continue }
+
+    const level = parseInt(levelM[1])
+    i++
+
+    // Validate this is a real item start by peeking past blanks/'%' to the first
+    // meaningful line.  If it's a pure integer (not a PN), the candidate "key" is an
+    // SA/mass value that the PDF viewer placed before the next item's real key — reject
+    // it so the outer loop can skip past it and find the actual key.
+    {
+      let pv = i
+      while (pv < lines.length && !lines[pv]) pv++
+      while (pv < lines.length && lines[pv] === '%') pv++
+      while (pv < lines.length && !lines[pv]) pv++
+      if (pv < lines.length && /^\d+$/.test(lines[pv]) && tryPN(lines[pv]) === null) {
+        i = keyIdx + 1
+        continue
+      }
+    }
+
+    // Skip blanks + optional lone R/C "%" markers
+    while (i < lines.length && !lines[i]) i++
+    let rc = false, soc = null
+    while (i < lines.length && lines[i] === '%') { rc = true; i++ }
+    while (i < lines.length && !lines[i]) i++
+
+    // Collect PN lines (customer PN then TG PN, or just TG PN)
+    let customerPartNo = null, tgPartNo = null
+    const firstPN = tryPN(lines[i])
+    if (firstPN !== null) {
+      if (/\*/.test(lines[i])) soc = '*'
+      i++
+      while (i < lines.length && !lines[i]) i++
+      const secondPN = tryPN(lines[i])
+      if (secondPN !== null) {
+        customerPartNo = firstPN
+        if (/\*/.test(lines[i])) soc = '*'
+        tgPartNo = secondPN
+        i++
+      } else {
+        tgPartNo = firstPN
+      }
+    }
+
+    while (i < lines.length && !lines[i]) i++
+
+    // Quantity: isolated integer after PN section
+    let quantity = 1
+    if (i < lines.length && /^\d+$/.test(lines[i])) { quantity = parseInt(lines[i]); i++ }
+
+    while (i < lines.length && !lines[i]) i++
+
+    // Level Code + Mass on same line ("1-2 1494")
+    let levelCode = null, massG = null
+    if (i < lines.length) {
+      const lm = lines[i].match(/^(\d+-\d+)[ \t]+([\d.]+)/)
+      if (lm) { levelCode = lm[1]; massG = parseFloat(lm[2]); i++ }
+    }
+
+    while (i < lines.length && !lines[i]) i++
+
+    // Part Name — collect until we hit a standards keyword, # row, material row, or next key
+    const nameParts = []
+    let productStd = null
+
+    while (i < lines.length && nameParts.length < 4) {
+      const nl = lines[i]
+      if (!nl) { i++; continue }
+      if (isSkip(rawLines[i]) || /^\s*#/.test(nl) || MATERIAL_ROW.test(nl)) break
+      if (/^[0-9][0-9,-]*$/.test(nl)) break
+      if (/^(IN DRAWING|NO|YES|N\/A)$/i.test(nl) && nameParts.length > 0) { productStd = nl; i++; break }
+      const ep = nl.match(/^(.+?)\s+(IN DRAWING|NO|YES|N\/A)\s*$/)
+      if (ep && nameParts.length > 0) { nameParts.push(ep[1]); productStd = ep[2]; i++; break }
+      nameParts.push(nl); i++
+    }
+    const partName = nameParts.join(' ').replace(/\s+/g, ' ')
+      .replace(/[　-〿぀-ヿ㐀-䶿一-鿿＀-￯]/g, '').trim() || null
+
+    // Material Standards
+    let materialStd = null
+    while (i < lines.length && !lines[i]) i++
+    if (i < lines.length && !MATERIAL_ROW.test(lines[i]) && !/^\s*#/.test(lines[i])
+        && !/^[0-9][0-9,-]*$/.test(lines[i])) {
+      const mm = lines[i].match(/^(IN DRAWING|NO|YES|N\/A)/i)
+      if (mm) { materialStd = mm[1]; i++ }
+    }
+
+    // Notes and material rows (consume until next item key)
+    const noteLines = []
+    let firstMatNo = null
+    while (i < lines.length) {
+      const nl = lines[i]
+      if (!nl || isSkip(rawLines[i])) { i++; continue }
+      if (/^[0-9][0-9,-]*$/.test(nl)) break
+      if (MATERIAL_ROW.test(nl)) {
+        if (!firstMatNo) firstMatNo = nl.trim().split(/[\t\s]+/)[0] || null
+        i++; continue
+      }
+      if (/^\s*#/.test(nl)) {
+        const afterHash = nl.replace(/^\s*#\s*/, '').split('\t')[0].trim()
+        if (afterHash && !/^\d+(\.\d+)?$/.test(afterHash) && noteLines.length < 2) noteLines.push(afterHash)
+        i++; continue
+      }
+      const nt = nl.replace(/\t/g, ' ').trim()
+      if (nt && !/^\d+(\.\d+)?$/.test(nt) && !/^(IN DRAWING|NO|YES|N\/A)$/i.test(nt) && noteLines.length < 2) {
+        noteLines.push(nt)
+      }
+      i++
+    }
+    let note = [firstMatNo, ...noteLines].filter(Boolean).join('  ').trim() || null
+
+    if (tgPartNo || partName) {
+      items.push({
+        key, level,
+        tg_part_no: tgPartNo, customer_part_no: customerPartNo,
+        part_name: partName, level_code: levelCode,
+        quantity, mass_g: massG,
+        soc, rc, use_portion: false,
+        product_standards: productStd, material_standards: materialStd,
+        note, material_no: firstMatNo, material_trade_name: null,
+        color_no: null, color_tone: null, material_type: null, sa: null,
+      })
+    }
+  }
+  return items
+}
+
+function parseBomItemsCompact(text) {
   const lines = text.split('\n')
   const items = []
   let i = 0
@@ -99,8 +331,8 @@ function parseBomItems(text) {
     const m = line.match(ROW_START)
     if (!m) { i++; continue }
 
-    const key = m[2]
-    const level = parseInt(m[3])
+    let key = m[2]
+    let level = parseInt(m[3])
     let customerPartNo = m[4] ? cleanPn(m[4]) : null
     i++
 
@@ -134,6 +366,33 @@ function parseBomItems(text) {
       const dashes = (pn.match(/-/g) || []).length
       return dashes >= 1 && (/[A-Za-z]/.test(pn) || dashes >= 2)
     }
+
+    // Detect "SA_value real_key [real_level]" false ROW_START matches.
+    // A PDF viewer sometimes merges the SA-column value of the previous item and the next
+    // item's key onto one line (e.g. "422 1" where 422 = mass, 1 = real key).  When that
+    // happens the real level appears alone on the very next line (a bare digit 1-6) rather
+    // than a part number.  Recover by re-interpreting: m[3] was the real key, and the
+    // following bare digit (or m[4] when all three tokens are on one line) is the real level.
+    if (m[4] && /^[1-6]$/.test(m[4].trim())) {
+      // "SA key level" all on one line — m[4] is the real level, not a customer PN
+      key = m[3]
+      level = parseInt(m[4].trim())
+      customerPartNo = null
+    } else if (!m[4]) {
+      // "SA key" on one line — peek at the next non-empty line for the real level
+      let peek = i
+      while (peek < lines.length && !lines[peek].trim()) peek++
+      if (peek < lines.length) {
+        const peeked = lines[peek].trim()
+        if (/^[1-6]$/.test(peeked) && !isPnLine(peeked)) {
+          key = m[3]
+          level = parseInt(peeked)
+          i = peek + 1
+          customerPartNo = null
+        }
+      }
+    }
+
     if (i < lines.length && isPnLine(lines[i])) {
       const f = pnFromLine(lines[i])
       if (f.rc) rc = true
@@ -165,7 +424,7 @@ function parseBomItems(text) {
     while (i < lines.length && (isSkip(lines[i]) || /^\s*#/.test(lines[i]))) i++
     let levelCode = null, massG = null
     if (i < lines.length) {
-      const lm = lines[i].match(/^(\d+-\d+)\s*\t\s*([\d.]+)/)
+      const lm = lines[i].match(/^(\d+-\d+)[ \t]+([\d.]+)/)
       if (lm) { levelCode = lm[1]; massG = parseFloat(lm[2]); i++ }
     }
 
@@ -229,9 +488,8 @@ function parseBomItems(text) {
       if (MATERIAL_ROW.test(lines[i])) {
         // "4-68403-00000 \tE5400S20X6 / E5400S20X6VN \tPolyester" → keep ONLY the material number
         if (!matInfo) {
-          const parts = lines[i].split('\t').map(s => s.trim()).filter(Boolean)
-          firstMatNo = parts[0] || null
-          matInfo = parts[0] || null   // drop trade name (E5400S20X6 / Nylon 66 sewing thread)
+          firstMatNo = lines[i].trim().split(/[\t\s]+/)[0] || null
+          matInfo = firstMatNo
         }
         i++; continue
       }
@@ -268,6 +526,33 @@ function parseBomItems(text) {
     }
   }
   return items
+}
+
+// Auto-detect format and dispatch to the correct parser.
+// Compact: "key level [PN]" all on one line (pdf-parse output or some PDF viewers).
+// Expanded: each column value on its own line (most PDF viewer copy-paste output).
+// A *real* compact row always carries a PN either inline (m[4]) or on the very next line.
+// False positives occur when level-code+mass like "1-2 3" accidentally matches ROW_START —
+// those lines are followed by a part name, not a PN.
+function parseBomItems(text) {
+  const lines = text.split('\n')
+  const hasRealCompactRow = lines.some((l, idx) => {
+    const m = ROW_START.exec(l)
+    if (!m) return false
+    // PN embedded on the same row (compact style)
+    if (m[4]) {
+      const tok = m[4].trim().split(/\s+/)[0]
+      if ((tok.match(/-/g) || []).length >= 1 && /[A-Za-z]/.test(tok)) return true
+    }
+    // PN on the next non-blank/non-skip line
+    let j = idx + 1
+    while (j < lines.length && (!lines[j]?.trim() || isSkip(lines[j]))) j++
+    if (j >= lines.length) return false
+    const nxt = lines[j].trim().split(/\s+/)[0]
+    return (nxt.match(/-/g) || []).length >= 1 && /[A-Za-z]/.test(nxt)
+  })
+  if (hasRealCompactRow) return parseBomItemsCompact(text)
+  return parseBomItemsExpanded(text)
 }
 
 const GEMINI_PROMPT = `
@@ -1054,6 +1339,168 @@ router.post('/pdf-text', upload.single('file'), async (req, res) => {
     const text = await extractTextFromPdf(req.file.buffer)
     res.json({ text, length: text.length })
   } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// ── POST /api/import/text — import DSI text pasted from PDF viewer ────────────
+router.post('/text', async (req, res) => {
+  const { text, bom_group: bomGroup } = req.body
+  if (!text?.trim()) return res.status(400).json({ error: 'No text provided' })
+
+  try {
+    // Save raw pasted text for debugging
+    fs.writeFileSync(path.join(__dirname, '../../uploads/debug-paste.txt'), text, 'utf8')
+
+    // Try tab-format header first, fall back to space-format (copy-paste from PDF viewer)
+    let header = parseHeader(text)
+    if (header.model === 'UNKNOWN' || !header.internal_eci_no) {
+      const ph = parsePastedHeader(text)
+      if (ph.model !== 'UNKNOWN' || ph.internal_eci_no) header = ph
+    }
+    const items = parseBomItems(text)
+    console.log('[text-import] parsed', items.length, 'items; first5:', items.slice(0,5).map(it => `key=${it.key} L${it.level} tg=${it.tg_part_no}`))
+
+    if (!items?.length) {
+      return res.status(422).json({ error: 'No BOM items found. Make sure the text is copied from a DSI document.' })
+    }
+    if (!header.customer_part_no?.trim()) header.customer_part_no = header.tg_part_no ?? null
+    if (!header.tg_part_no?.trim())       header.tg_part_no       = header.customer_part_no ?? null
+    if (!header.customer_part_no && !header.tg_part_no) {
+      return res.status(422).json({ error: 'Could not detect part numbers in the pasted text.' })
+    }
+
+    const client = await pool.connect()
+    try {
+      await client.query('BEGIN')
+
+      const modelId    = await upsertModel(client, header.model ?? 'UNKNOWN')
+      const customerId = await upsertCustomer(client, header.customer_code ?? 'UNKNOWN')
+      const effDate    = new Date()
+
+      let dsId
+      const { rows: dsExist } = await client.query(
+        'SELECT design_spec_id FROM tg.design_spec WHERE internal_eci_no=$1 LIMIT 1',
+        [header.internal_eci_no]
+      )
+
+      if (dsExist.length) {
+        dsId = dsExist[0].design_spec_id
+        await client.query(
+          `UPDATE tg.design_spec SET
+             model_id=$1, customer_id=$2, customer_part_no=$3, tg_part_no=$4,
+             production_level=$5, initial_stage=$6, reg_certif=$7,
+             effective_date=$8, customer_standard=$9, tg_standard=$10,
+             updated_by=$11, updated_at=NOW()
+           WHERE design_spec_id=$12`,
+          [modelId, customerId, header.customer_part_no, header.tg_part_no,
+           header.production_level, header.initial_stage, header.reg_certif,
+           effDate, header.customer_standards, header.tg_standards,
+           req.user?.full_name || req.user?.username || null, dsId]
+        )
+        await client.query('DELETE FROM tg.bom WHERE design_spec_id=$1', [dsId])
+        await client.query('DELETE FROM tg.product_variant WHERE design_spec_id=$1', [dsId])
+      } else {
+        const r = await client.query(
+          `INSERT INTO tg.design_spec
+             (model_id, customer_id, customer_part_no, tg_part_no, internal_eci_no,
+              production_level, initial_stage, reg_certif, effective_date,
+              customer_standard, tg_standard, bom_group, created_by, updated_by, updated_at, prepared_by)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13,NOW(),$13) RETURNING design_spec_id`,
+          [modelId, customerId, header.customer_part_no, header.tg_part_no,
+           header.internal_eci_no, header.production_level, header.initial_stage,
+           header.reg_certif, effDate, header.customer_standards, header.tg_standards,
+           bomGroup, req.user?.full_name || req.user?.username || null]
+        )
+        dsId = r.rows[0].design_spec_id
+        await client.query('SAVEPOINT sp_evt')
+        try {
+          await client.query('UPDATE tg.design_spec SET evt_first_issue=true WHERE design_spec_id=$1', [dsId])
+          await client.query('RELEASE SAVEPOINT sp_evt')
+        } catch { await client.query('ROLLBACK TO SAVEPOINT sp_evt') }
+        await client.query('SAVEPOINT sp_rev')
+        try {
+          await client.query(
+            `INSERT INTO tg.bom_revision
+               (design_spec_id, sort_order, mark, revision_record, eci_no, revision_date, revisioner)
+             VALUES ($1,0,'–','First issue',$2,$3,$4)`,
+            [dsId, header.internal_eci_no, effDate, req.user?.full_name || req.user?.username || null]
+          )
+          await client.query('RELEASE SAVEPOINT sp_rev')
+        } catch { await client.query('ROLLBACK TO SAVEPOINT sp_rev') }
+      }
+
+      // Insert BOM items (same logic as /pdf route)
+      const partCache = {}
+      const variantCache = {}
+      const keyLevelStack = {}
+      function getStack(k) { if (!keyLevelStack[k]) keyLevelStack[k] = {}; return keyLevelStack[k] }
+      function updateStack(k, level, partId) {
+        const st = getStack(k); st[level] = partId
+        for (const lv of Object.keys(st).map(Number)) { if (lv > level) delete st[lv] }
+      }
+
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i]
+        const level = Math.max(1, Math.min(6, parseInt(item.level) || 1))
+        const keyInts = parseKeyInts(item.key)
+        const partId = await upsertPart(client, partCache, item, i)
+
+        if (level === 1 && keyInts.length === 1) {
+          const vKey = keyInts[0]; const ks = String(vKey)
+          const vr = await client.query(
+            `INSERT INTO tg.product_variant
+               (design_spec_id, variant_key, customer_part_no, tg_part_no, part_name, mass_gram)
+             VALUES ($1,$2,$3,$4,$5,$6) RETURNING variant_id`,
+            [dsId, vKey, item.customer_part_no?.trim() ?? null,
+             item.tg_part_no?.trim() || 'UNKNOWN', item.part_name ?? null, item.mass_g ?? null]
+          )
+          variantCache[ks] = vr.rows[0].variant_id
+          await client.query(
+            `INSERT INTO tg.bom (design_spec_id, variant_id, parent_part_id, child_part_id, bom_level, level_code, quantity, sort_order)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+            [dsId, variantCache[ks], null, partId, level, item.level_code ?? null, Math.round(item.quantity ?? 1), i]
+          )
+          updateStack(ks, level, partId)
+        } else if (keyInts.length > 0) {
+          for (const vKey of keyInts) {
+            const ks = String(vKey)
+            const parentPartId = level > 1 ? (getStack(ks)[level - 1] ?? null) : null
+            await client.query(
+              `INSERT INTO tg.bom (design_spec_id, variant_id, parent_part_id, child_part_id, bom_level, level_code, quantity, sort_order)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+              [dsId, variantCache[ks] ?? null, parentPartId, partId,
+               level, item.level_code ?? null, Math.round(item.quantity ?? 1), i]
+            )
+            updateStack(ks, level, partId)
+          }
+        } else {
+          let parentPartId = null
+          if (level > 1) {
+            for (const st of Object.values(keyLevelStack)) {
+              if (st[level - 1]) { parentPartId = st[level - 1]; break }
+            }
+          }
+          await client.query(
+            `INSERT INTO tg.bom (design_spec_id, variant_id, parent_part_id, child_part_id, bom_level, level_code, quantity, sort_order)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+            [dsId, null, parentPartId, partId, level, item.level_code ?? null, Math.round(item.quantity ?? 1), i]
+          )
+        }
+      }
+
+      await client.query('COMMIT')
+      logActivity(req.user, 'import', header.tg_part_no,
+        (bomGroup ? bomGroup + ' · ' : '') + 'ECI ' + (header.internal_eci_no ?? '') + ' (text)')
+      res.json({ design_spec_id: dsId, customer_part_no: header.customer_part_no })
+    } catch (e) {
+      await client.query('ROLLBACK')
+      throw e
+    } finally {
+      client.release()
+    }
+  } catch (e) {
+    console.error('Text import error:', e)
     res.status(500).json({ error: e.message })
   }
 })

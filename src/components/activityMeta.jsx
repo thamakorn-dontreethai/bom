@@ -14,12 +14,14 @@ const ICONS = {
 
 const LABELS = {
   login: 'Signed in', logout: 'Signed out', import: 'Added BOM', revise: 'Updated BOM',
+  edit: 'Edited BOM',
   delete: 'Deleted BOM', add_user: 'Added user', remove_user: 'Removed user', change_password: 'Changed password',
 }
 
 // Coloured timeline dot per action.
 export const ACTION_CLASS = {
   login: 'act-login', logout: 'act-out', import: 'act-add', revise: 'act-edit',
+  edit: 'act-edit',
   delete: 'act-del', add_user: 'act-add', remove_user: 'act-del', change_password: 'act-edit',
 }
 

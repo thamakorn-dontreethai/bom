@@ -19,6 +19,7 @@ export default function BomCompletion({ bom, onRefresh }) {
   const [activeKey, setActiveKey] = useState(allKeys[0] ?? '0')
   const [rows, setRows] = useState({})
   const [saving, setSaving] = useState(false)
+  const dirty = Object.keys(rows).length > 0
 
   const dbRows = useMemo(() => {
     const init = {}
@@ -92,9 +93,10 @@ export default function BomCompletion({ bom, onRefresh }) {
   }
 
   async function save() {
+    if (!dirty) return
     setSaving(true); setMsg(null)
     try {
-      await Promise.all(Object.entries(rows).map(([id, v]) =>
+      const results = await Promise.all(Object.entries(rows).map(([id, v]) =>
         fetch(`/api/bom/${bom.id}/items/${id}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
@@ -116,6 +118,8 @@ export default function BomCompletion({ bom, onRefresh }) {
           }),
         })
       ))
+      if (results.some(r => !r.ok)) throw new Error('save failed')
+      setRows({})
       setMsg('ok'); onRefresh?.()
     } catch { setMsg('err') }
     finally { setSaving(false); setTimeout(() => setMsg(null), 3000) }
@@ -274,7 +278,7 @@ export default function BomCompletion({ bom, onRefresh }) {
       <div className="comp-footer">
         {msg === 'ok' && <span className="comp-msg comp-msg--ok">✓ Saved</span>}
         {msg === 'err' && <span className="comp-msg comp-msg--err">⚠ Save failed</span>}
-        <button className="bdv-btn" onClick={save} disabled={saving}>
+        <button className="bdv-btn" onClick={save} disabled={saving || !dirty}>
           {saving ? 'Saving...' : '💾 Save'}
         </button>
       </div>

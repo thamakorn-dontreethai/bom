@@ -1,4 +1,5 @@
-import { useRef, useState, useEffect } from 'react'
+import { useRef, useState, useEffect, useCallback } from 'react'
+import { IconPlus, IconPencil } from './activityMeta'
 import jsPDF from 'jspdf'
 import html2canvas from 'html2canvas'
 import { exportBomToExcel, exportBomMatrix } from '../utils/exportBomExcel'
@@ -169,6 +170,7 @@ export default function BomDocumentView({ bom, onRefresh }) {
   const [busy, setBusy] = useState(false)
   const [saving, setSaving] = useState(false)
   const [saveMsg, setSaveMsg] = useState(null)
+  const [headerDirty, setHeaderDirty] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const [blinking, setBlinking] = useState(false)
   const [showRevDialog, setShowRevDialog] = useState(false)
@@ -235,6 +237,7 @@ export default function BomDocumentView({ bom, onRefresh }) {
   })
 
   useEffect(() => {
+    setHeaderDirty(false)
     setHeader({
       evt_first_issue: bom.evt_first_issue ?? false,
       evt_cv: bom.evt_cv ?? false,
@@ -260,12 +263,14 @@ export default function BomDocumentView({ bom, onRefresh }) {
 
   function setRevName(mark, field, val) {
     setRevNames(prev => ({ ...prev, [mark]: { ...(prev[mark] ?? {}), [field]: val } }))
+    setHeaderDirty(true)
   }
 
-  function onToggle(key) { setHeader(h => ({ ...h, [key]: !h[key] })) }
-  function onField(key, val) { setHeader(h => ({ ...h, [key]: val })) }
+  function onToggle(key) { setHeader(h => ({ ...h, [key]: !h[key] })); setHeaderDirty(true) }
+  function onField(key, val) { setHeader(h => ({ ...h, [key]: val })); setHeaderDirty(true) }
 
-  async function saveHeader() {
+  const saveHeader = useCallback(async () => {
+    if (!headerDirty) return
     setSaving(true)
     setSaveMsg(null)
     try {
@@ -279,6 +284,7 @@ export default function BomDocumentView({ bom, onRefresh }) {
       })
       if (!r.ok) throw new Error()
       setSaveMsg('ok')
+      setHeaderDirty(false)
       onRefresh?.()   // reload BOM so the "edited by · time" updates immediately
     } catch {
       setSaveMsg('err')
@@ -286,7 +292,7 @@ export default function BomDocumentView({ bom, onRefresh }) {
       setSaving(false)
       setTimeout(() => setSaveMsg(null), 3000)
     }
-  }
+  }, [bom.id, header, revNames, onRefresh, headerDirty])
 
   function showAllPages() {
     pageRefs.current.filter(Boolean).forEach(el => { el.style.display = 'block' })
@@ -486,7 +492,7 @@ export default function BomDocumentView({ bom, onRefresh }) {
   // Export / Print — choose which key (page) to include
   const [exportMode, setExportMode] = useState(null)   // null | 'pdf' | 'print'
   const [exportSel, setExportSel] = useState([])        // selected page indices
-  function openExport(mode) {
+  const openExport = useCallback((mode) => {
     if (busy || saving) return
     if (pages.length <= 1) {
       if (mode === 'excel') exportBomToExcel(bom, 'all', activeView)
@@ -496,7 +502,7 @@ export default function BomDocumentView({ bom, onRefresh }) {
     }
     setExportSel(pages.map((_, i) => i))               // default: all pages
     setExportMode(mode)
-  }
+  }, [busy, saving, pages, bom, activeView, download, printDoc])
   function toggleExportPage(i) {
     setExportSel(s => s.includes(i) ? s.filter(x => x !== i) : [...s, i])
   }
@@ -571,7 +577,7 @@ export default function BomDocumentView({ bom, onRefresh }) {
     <div className="bdv-wrap">
       <div className="bdv-toolbar">
         {/* left — save + reset + approval */}
-        <button className="bdv-btn bdv-btn--secondary" onClick={saveHeader} disabled={saving || busy}>
+        <button className="bdv-btn bdv-btn--secondary" onClick={saveHeader} disabled={saving || busy || !headerDirty}>
           {saving ? 'Saving…' : '💾 Save'}
         </button>
         <button className="bdv-btn bdv-btn--rev" onClick={() => setShowRevDialog(true)} disabled={busy || saving}>
@@ -593,8 +599,8 @@ export default function BomDocumentView({ bom, onRefresh }) {
         {/* spacer */}
         <div className="bdv-toolbar-spacer" />
         <div className="bdv-audit">
-          {bom.created_by && <span title="Added this BOM">➕ {bom.created_by}</span>}
-          {bom.updated_by && <span title="Last updated">✏️ {bom.updated_by}{bom.updated_at ? ` · ${bom.updated_at}` : ''}</span>}
+          {bom.created_by && <span title="Added this BOM"><IconPlus /> {bom.created_by}</span>}
+          {bom.updated_by && <span title="Last updated"><IconPencil /> {bom.updated_by}{bom.updated_at ? ` · ${bom.updated_at}` : ''}</span>}
         </div>
         {saveMsg === 'ok' && <span className="bdv-save-msg bdv-save-msg--ok">✓ Saved</span>}
         {saveMsg === 'err' && <span className="bdv-save-msg bdv-save-msg--err">⚠ Save failed</span>}

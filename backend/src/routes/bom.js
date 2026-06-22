@@ -200,6 +200,11 @@ router.patch('/:id/header', async (req, res) => {
       }
     }
 
+    const { rows: dsR } = await pool.query(
+      `SELECT tg_part_no FROM tg.design_spec WHERE design_spec_id=$1`, [dsId]
+    )
+    logActivity(req.user, 'edit', dsR[0]?.tg_part_no ?? String(dsId), 'Saved header')
+
     res.json({ saved: true })
   } catch (e) {
     res.status(500).json({ error: e.message })
@@ -368,6 +373,12 @@ router.post('/:id/revision', async (req, res) => {
   try {
     await client.query('BEGIN')
 
+    // Fetch design spec part no. for activity log
+    const { rows: dsRows } = await client.query(
+      `SELECT ds.tg_part_no FROM tg.design_spec ds WHERE ds.design_spec_id = $1`, [dsId]
+    )
+    const dsTgPartNo = dsRows[0]?.tg_part_no ?? String(dsId)
+
     // ── Metadata-only items: direct UPDATE to part + bom, no revision mark ──
     for (const { bom_id, new_part_name, new_note, new_quantity, new_mass } of metaOnlyItems) {
       const { rows: cur } = await client.query(
@@ -456,6 +467,37 @@ router.post('/:id/revision', async (req, res) => {
       )
       const maxLevel = lvRows[0].max_level ?? 0
       newLevel = maxLevel === 0 ? 2 : maxLevel + 1
+    }
+
+    // ── Auto-generate revision record text from diff (before applying changes) ──
+    let autoRevRecord = 'Update ECI No.'
+    if (pnChangeItems.length > 0 || new_tg_part_no?.trim()) {
+      const recordParts = []
+
+      if (pnChangeItems.length > 0) {
+        const bomIds = pnChangeItems.map(i => i.bom_id)
+        const { rows: oldRows } = await client.query(
+          `SELECT b.bom_id,
+                  COALESCE(b.snapshot_part_name, p.part_name) AS part_name,
+                  p.tg_part_no
+           FROM tg.bom b JOIN tg.part p ON p.part_id = b.child_part_id
+           WHERE b.bom_id = ANY($1::int[]) AND b.design_spec_id = $2`,
+          [bomIds, dsId]
+        )
+        const oldMap = Object.fromEntries(oldRows.map(r => [String(r.bom_id), r]))
+        const changes = pnChangeItems.map(item => {
+          const old = oldMap[String(item.bom_id)]
+          const name = old?.part_name || old?.tg_part_no || `item#${item.bom_id}`
+          return `${name} (${item.new_part_no})`
+        })
+        recordParts.push(`Change of component part: ${changes.join(', ')}`)
+      }
+
+      if (new_tg_part_no?.trim()) {
+        recordParts.push(`Updated TG Part No. to ${new_tg_part_no.trim()}`)
+      }
+
+      autoRevRecord = recordParts.join('. ')
     }
 
     // ── Part No. change items: full revision flow ──
@@ -610,8 +652,9 @@ router.post('/:id/revision', async (req, res) => {
       await client.query(
         `INSERT INTO tg.bom_revision
            (design_spec_id, sort_order, mark, revision_record, eci_no, revision_date, revisioner, approved_by, pdf_url)
-         VALUES ($1, $2, $3, 'Update ECI No.', $4, $5, $6, $7, $8)`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
         [dsId, newLevel, String(newLevel),
+         autoRevRecord,
          eci_no ?? null,
          revision_date ? new Date(revision_date) : null,
          revisioner ?? null,
@@ -621,6 +664,18 @@ router.post('/:id/revision', async (req, res) => {
     }
 
     await client.query('COMMIT')
+
+    const hasChanges = pnChangeItems.length > 0 || metaOnlyItems.length > 0 || new_tg_part_no?.trim()
+    if (hasChanges) {
+      let actDetail = null
+      if (pnChangeItems.length > 0 || new_tg_part_no?.trim()) {
+        actDetail = autoRevRecord !== 'Update ECI No.' ? autoRevRecord : null
+      } else if (metaOnlyItems.length > 0) {
+        actDetail = `Updated data for ${metaOnlyItems.length} item${metaOnlyItems.length > 1 ? 's' : ''}`
+      }
+      logActivity(req.user, 'edit', dsTgPartNo, actDetail)
+    }
+
     res.json({ update_level: newLevel })
   } catch (e) {
     await client.query('ROLLBACK')

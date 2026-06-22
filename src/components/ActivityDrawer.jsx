@@ -1,10 +1,11 @@
 import { useState, useEffect } from 'react'
-import { ActionLabel, ACTION_CLASS, IconPlus, IconTrash, IconSignInOut } from './activityMeta'
+import { ActionLabel, ACTION_CLASS, IconPlus, IconPencil, IconTrash, IconSignInOut } from './activityMeta'
 
 const ACT_FILTERS = [
   { id: 'all', label: 'All', actions: null },
   { id: 'inout', label: <><IconSignInOut /> Sign in/out</>, actions: ['login', 'logout'] },
   { id: 'add', label: <><IconPlus /> Added</>, actions: ['import', 'revise'] },
+  { id: 'edit', label: <><IconPencil /> Edited</>, actions: ['edit'] },
   { id: 'remove', label: <><IconTrash /> Deleted</>, actions: ['delete'] },
 ]
 
@@ -44,12 +45,17 @@ export default function ActivityDrawer({ open, onClose, isAdmin = false }) {
         <div className="act-timeline" style={{ maxHeight: 'none', flex: 1, padding: '8px 18px 18px' }}>
           {shown.length === 0 && <div style={{ color: '#94a3b8', fontSize: 13, padding: 20, textAlign: 'center' }}>No records</div>}
           {shown.map(a => (
-            <div key={a.id} className="act-row">
+            <div key={a.id} className="act-row" style={{ flexWrap: 'wrap', rowGap: 2 }}>
               <span className={`act-dot ${ACTION_CLASS[a.action] || ''}`} />
               <span className="act-when">{a.at}</span>
               <span className="act-user">{a.user_name}</span>
               <ActionLabel action={a.action} />
               {a.target && <span className="act-target">{a.target}</span>}
+              {a.detail && (
+                <span style={{ width: '100%', paddingLeft: 22, fontSize: 11, color: '#94a3b8', marginTop: 1 }}>
+                  {a.detail}
+                </span>
+              )}
             </div>
           ))}
         </div>
@@ -57,3 +63,4 @@ export default function ActivityDrawer({ open, onClose, isAdmin = false }) {
     </div>
   )
 }
+
