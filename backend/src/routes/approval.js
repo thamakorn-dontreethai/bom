@@ -5,6 +5,7 @@ import path from 'path'
 import { fileURLToPath } from 'url'
 import nodemailer from 'nodemailer'
 import { pool } from '../db.js'
+import { logActivity } from '../activity.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const APPROVALS_DIR = path.join(__dirname, '../../uploads/approvals')
@@ -178,14 +179,18 @@ router.post('/:token', express.urlencoded({ extended: false }), async (req, res)
   )
 
   // Update design_spec (first row) and all bom_revision rows
-  await pool.query(
-    `UPDATE tg.design_spec SET approved_by = $1 WHERE design_spec_id = $2`,
+  const { rows: dsRows } = await pool.query(
+    `UPDATE tg.design_spec SET approved_by = $1 WHERE design_spec_id = $2 RETURNING tg_part_no`,
     [approvedBy, t.bom_id]
   )
   await pool.query(
     `UPDATE tg.bom_revision SET approved_by = $1 WHERE design_spec_id = $2`,
     [approvedBy, t.bom_id]
   )
+
+  // Record approval in the activity timeline (who approved which BOM, when)
+  const partNo = dsRows[0]?.tg_part_no ?? String(t.bom_id)
+  logActivity({ full_name: approvedBy }, 'approve', partNo, `Approved by ${approvedBy}`)
 
   // Notify any open SSE connections for this BOM
   const clients = sseClients.get(t.bom_id)

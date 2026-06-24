@@ -80,7 +80,7 @@ router.post('/change-password', requireAuth, async (req, res) => {
 router.get('/activity', requireAuth, async (req, res) => {
   const limit = Math.min(parseInt(req.query.limit) || 100, 500)
   const isAdmin = req.user.role === 'admin'
-  const where = isAdmin ? '' : `WHERE action IN ('import','revise','edit','delete')`
+  const where = isAdmin ? '' : `WHERE action IN ('import','revise','edit','delete','approve')`
   const { rows } = await pool.query(
     `SELECT id, user_name, action, target, detail,
             to_char(created_at AT TIME ZONE 'Asia/Bangkok', 'DD-Mon-YY HH24:MI:SS') AS at,

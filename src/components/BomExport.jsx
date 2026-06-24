@@ -1,16 +1,32 @@
 import { useState, useEffect } from 'react'
+import BomDocumentView from './BomDocumentView'
 
+// History tab — old BOM versions. Each version is a full snapshot saved BEFORE an
+// update/revision, so clicking a card shows the OLD BOM document (read-only, clean).
 export default function BomExport({ bom }) {
-  const [zoom, setZoom] = useState(null)
-  const [history, setHistory] = useState([])
+  const [versions, setVersions] = useState([])
+  const [viewing, setViewing] = useState(null)   // snapshot bom object being viewed
+  const [loading, setLoading] = useState(false)
 
   useEffect(() => {
     if (!bom?.id) return
-    fetch(`/api/bom/${bom.id}/image-history`)
-      .then(r => r.json())
-      .then(setHistory)
+    fetch(`/api/bom/${bom.id}/versions`)
+      .then(r => (r.ok ? r.json() : []))
+      .then(setVersions)
       .catch(() => {})
   }, [bom?.id])
+
+  async function openVersion(v) {
+    setLoading(true)
+    try {
+      const r = await fetch(`/api/bom/${bom.id}/versions/${v.id}`)
+      if (r.ok) {
+        const snap = await r.json()
+        setViewing({ ...snap, _label: v.version_label, _at: v.created_at, _by: v.created_by })
+      }
+    } catch (_) { /* ignore */ }
+    finally { setLoading(false) }
+  }
 
   return (
     <div className="ph-wrap">
@@ -29,59 +45,55 @@ export default function BomExport({ bom }) {
         ))}
       </div>
 
-      {/* Image history */}
       <div className="ph-section-title">
-        Update History
-        {history.length > 0 && <span className="ph-count">{history.length} items</span>}
+        Version History
+        {versions.length > 0 && <span className="ph-count">{versions.length} versions</span>}
       </div>
-      {history.length === 0 ? (
-        <div className="ph-empty">No update history yet</div>
+
+      {versions.length === 0 ? (
+        <div className="ph-empty">No old versions yet — a snapshot is saved here every time the BOM is updated/revised.</div>
       ) : (
-        <div className="ph-history-list">
-          {history.map(h => (
-            <div key={h.id} className="ph-history-row" onClick={() => setZoom({ image_url: h.image_url, tg_part_no: h.tg_part_no, part_name: h.part_name, level: h.level })}>
-              <img src={h.image_url} alt={h.tg_part_no} className="ph-history-thumb" />
-              <div className="ph-history-info">
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
-                  <span className="ph-pn">{h.tg_part_no ?? '–'}</span>
-                  <span className={`ph-event-badge ph-event-badge--${h.event_type ?? 'added'}`}>
-                    {h.event_type === 'added'          ? '+ Added'
-                    : h.event_type === 'revised'        ? '✎ Updated Document'
-                    : h.event_type === 'image_replaced' ? '🖼 Image Replaced'
-                    : h.event_type}
-                  </span>
+        <div className="ver-list">
+          {versions.map((v, i) => (
+            <div key={v.id} className="ver-card ver-card--clickable" onClick={() => openVersion(v)}
+              title="View this old BOM (read-only)">
+              <div className="ver-badge"><span className="ver-badge-doc">📄</span></div>
+              <div className="ver-body">
+                <div className="ver-title-row">
+                  <span className="ver-record">{v.version_label || `Version ${versions.length - i}`}</span>
                 </div>
-                <div className="ph-name">{h.part_name}</div>
-                <div className="ph-meta">
-                  Lv.{h.level}
-                  {h.quantity != null ? ` · ${h.quantity} pcs` : ''}
-                  {h.mass_gram != null ? ` · ${Number(h.mass_gram).toLocaleString()} g` : ''}
-                  {h.spec ? ` · ${h.spec}` : ''}
+                <div className="ver-meta">
+                  {v.eci_no && <span>ECI: <b>{v.eci_no}</b></span>}
+                  {v.created_at && <span>📅 {v.created_at}</span>}
+                  {v.created_by && <span>✏️ {v.created_by}</span>}
                 </div>
               </div>
-              <div className="ph-history-date">{h.recorded_at}</div>
+              <div className="ver-action"><span className="ver-open">👁 View old BOM →</span></div>
             </div>
           ))}
         </div>
       )}
 
-      {/* Zoom overlay */}
-      {zoom && (
-        <div className="ph-zoom-overlay" onClick={() => setZoom(null)}>
-          <div className="ph-zoom-box" onClick={e => e.stopPropagation()}>
-            <button className="ph-zoom-close" onClick={() => setZoom(null)}>✕</button>
-            <img src={zoom.image_url} alt={zoom.tg_part_no} className="ph-zoom-img" />
-            <div className="ph-zoom-info">
-              <span className="ph-pn">{zoom.tg_part_no ?? '–'}</span>
-              <span style={{ margin: '0 8px', color: '#ccc' }}>·</span>
-              <span>{zoom.part_name}</span>
-              <span style={{ margin: '0 8px', color: '#ccc' }}>·</span>
-              <span style={{ color: '#aaa', fontSize: 12 }}>Lv.{zoom.level}</span>
+      {loading && <div className="ph-empty">Loading version…</div>}
+
+      {/* Read-only old-version viewer */}
+      {viewing && (
+        <div className="ver-overlay" onClick={() => setViewing(null)}>
+          <div className="ver-overlay-card" onClick={e => e.stopPropagation()}>
+            <div className="ver-overlay-bar">
+              <span className="ver-overlay-title">
+                🕐 Old version: <b>{viewing._label || 'Snapshot'}</b>
+                {viewing._at && <span className="ver-overlay-sub"> · {viewing._at}{viewing._by ? ` · ${viewing._by}` : ''}</span>}
+                <span className="ver-overlay-ro">READ-ONLY</span>
+              </span>
+              <button className="ver-overlay-close" onClick={() => setViewing(null)}>✕ Close</button>
+            </div>
+            <div className="ver-overlay-body">
+              <BomDocumentView bom={viewing} readOnly />
             </div>
           </div>
         </div>
       )}
     </div>
-    
   )
 }

@@ -10,12 +10,14 @@ const ICONS = {
   add_user:        <svg {...I}><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><line x1="19" y1="8" x2="19" y2="14" /><line x1="22" y1="11" x2="16" y2="11" /></svg>,
   remove_user:     <svg {...I}><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><line x1="22" y1="11" x2="16" y2="11" /></svg>,
   change_password: <svg {...I}><rect x="3" y="11" width="18" height="11" rx="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" /></svg>,
+  approve:         <svg {...I}><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" /><polyline points="22 4 12 14.01 9 11.01" /></svg>,
 }
 
 const LABELS = {
   login: 'Signed in', logout: 'Signed out', import: 'Added BOM', revise: 'Updated BOM',
   edit: 'Edited BOM',
   delete: 'Deleted BOM', add_user: 'Added user', remove_user: 'Removed user', change_password: 'Changed password',
+  approve: 'Approved BOM',
 }
 
 // Coloured timeline dot per action.
@@ -23,6 +25,7 @@ export const ACTION_CLASS = {
   login: 'act-login', logout: 'act-out', import: 'act-add', revise: 'act-edit',
   edit: 'act-edit',
   delete: 'act-del', add_user: 'act-add', remove_user: 'act-del', change_password: 'act-edit',
+  approve: 'act-approve',
 }
 
 // Small inline icons (reusable in filter chips, BOM list, etc.)

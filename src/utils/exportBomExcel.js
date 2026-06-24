@@ -555,8 +555,11 @@ export async function exportBomToExcel(bom, keys = 'all', view = null) {
     })
   }
 
-  // Load the template workbook once.
-  const url = `${import.meta.env?.BASE_URL ?? '/'}${cfg.file}`
+  // Load the template workbook once — use this BOM's uploaded custom template if set,
+  // otherwise the default HE/Bag form.
+  const url = bom.custom_template_url
+    ? bom.custom_template_url
+    : `${import.meta.env?.BASE_URL ?? '/'}${cfg.file}`
   const buf = await fetch(url).then(r => {
     if (!r.ok) throw new Error(`template not found: ${url}`)
     return r.arrayBuffer()

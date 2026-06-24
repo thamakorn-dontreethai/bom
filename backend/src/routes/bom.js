@@ -33,6 +33,17 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 },
 })
 
+// Custom Excel BOM templates (per-BOM export form) → uploads/templates-custom
+const TPL_DIR = path.join(__dirname, '../../uploads/templates-custom')
+if (!fs.existsSync(TPL_DIR)) fs.mkdirSync(TPL_DIR, { recursive: true })
+const uploadTemplate = multer({
+  storage: multer.diskStorage({
+    destination: TPL_DIR,
+    filename: (_req, file, cb) => cb(null, `tpl-${Date.now()}-${file.originalname.replace(/[^\w.\-]+/g, '_')}`),
+  }),
+  limits: { fileSize: 15 * 1024 * 1024 },
+})
+
 const HEADER_SELECT = `
   SELECT
     ds.design_spec_id                             AS id,
@@ -55,6 +66,7 @@ const HEADER_SELECT = `
     ds.approved_by,
     ds.confirmed_by,
     ds.pdf_url,
+    ds.custom_template_url,
     ds.bom_group,
     ds.created_by,
     ds.updated_by,
@@ -256,105 +268,122 @@ router.delete('/:id/views/:viewId', async (req, res) => {
 })
 
 // GET /api/bom/:id
+// Build the full BOM object (header + items + revisions + history + views) for a
+// design_spec. Returns null if not found. Reused by GET /:id and the version snapshot.
+async function buildBomObject(dsId) {
+  const { rows: h } = await pool.query(HEADER_SELECT + ' WHERE ds.design_spec_id = $1', [dsId])
+  if (!h.length) return null
+
+  const { rows: items } = await pool.query(ITEMS_SQL, [dsId])
+
+  let revisions = []
+  try {
+    const { rows } = await pool.query(
+      `SELECT mark, revision_record, eci_no,
+              to_char(revision_date, 'DD-Mon-YY') AS revision_date,
+              revisioner, approved_by, pdf_url
+       FROM tg.bom_revision WHERE design_spec_id = $1 ORDER BY sort_order, revision_id`, [dsId])
+    revisions = rows
+  } catch (_) {}
+
+  let itemHistory = {}, itemUpdateLevels = {}
+  try {
+    const [histRes, levRes] = await Promise.all([
+      pool.query(
+        `SELECT bih.bom_id, bih.introduced_at, bih.superseded_at, bih.old_tg_part_no
+         FROM tg.bom_item_history bih JOIN tg.bom b ON b.bom_id = bih.bom_id
+         WHERE b.design_spec_id = $1 ORDER BY bih.bom_id, bih.superseded_at`, [dsId]),
+      pool.query('SELECT bom_id, update_level FROM tg.bom WHERE design_spec_id = $1', [dsId]),
+    ])
+    histRes.rows.forEach(r => { (itemHistory[r.bom_id] ??= []).push(r) })
+    levRes.rows.forEach(r => { itemUpdateLevels[r.bom_id] = r.update_level })
+  } catch (_) {}
+
+  let tgtHistory = [], tgtUpdateLevel = 0
+  try {
+    const [tgtHRes, tgtLRes] = await Promise.all([
+      pool.query(
+        `SELECT introduced_at, superseded_at, old_tg_part_no
+         FROM tg.design_spec_tgt_history WHERE design_spec_id = $1 ORDER BY superseded_at`, [dsId]),
+      pool.query('SELECT tgt_update_level FROM tg.design_spec WHERE design_spec_id = $1', [dsId]),
+    ])
+    tgtHistory = tgtHRes.rows
+    tgtUpdateLevel = tgtLRes.rows[0]?.tgt_update_level ?? 0
+  } catch (_) {}
+
+  const enrichedItems = items.map(item => ({
+    ...item,
+    update_level: itemUpdateLevels[item.id] ?? 0,
+    history: itemHistory[item.id] ?? [],
+  }))
+
+  let views = []
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, key_code, name, part_nos, created_by, to_char(created_at,'DD-Mon-YY') AS created
+       FROM tg.bom_view WHERE design_spec_id = $1 ORDER BY id`, [dsId])
+    views = rows
+  } catch (_) {}
+
+  return { ...h[0], tgt_history: tgtHistory, tgt_update_level: tgtUpdateLevel, revisions, items: enrichedItems, views }
+}
+
 router.get('/:id', async (req, res) => {
   try {
-    const { rows: h } = await pool.query(
-      HEADER_SELECT + ' WHERE ds.design_spec_id = $1', [req.params.id]
-    )
-    if (!h.length) return res.status(404).json({ error: 'BOM not found' })
-
-    const { rows: items } = await pool.query(ITEMS_SQL, [req.params.id])
-
-    // bom_revision rows (migration_001+)
-    let revisions = []
-    try {
-      const { rows } = await pool.query(
-        `SELECT mark, revision_record, eci_no,
-                to_char(revision_date, 'DD-Mon-YY') AS revision_date,
-                revisioner, approved_by, pdf_url
-         FROM tg.bom_revision
-         WHERE design_spec_id = $1
-         ORDER BY sort_order, revision_id`,
-        [req.params.id]
-      )
-      revisions = rows
-    } catch (_) {}
-
-    // Per-item update history (migration_002 — skip if not yet applied)
-    let itemHistory = {}
-    let itemUpdateLevels = {}
-    try {
-      const [histRes, levRes] = await Promise.all([
-        pool.query(
-          `SELECT bih.bom_id, bih.introduced_at, bih.superseded_at, bih.old_tg_part_no
-           FROM tg.bom_item_history bih
-           JOIN tg.bom b ON b.bom_id = bih.bom_id
-           WHERE b.design_spec_id = $1
-           ORDER BY bih.bom_id, bih.superseded_at`,
-          [req.params.id]
-        ),
-        pool.query(
-          'SELECT bom_id, update_level FROM tg.bom WHERE design_spec_id = $1',
-          [req.params.id]
-        ),
-      ])
-      histRes.rows.forEach(r => {
-        if (!itemHistory[r.bom_id]) itemHistory[r.bom_id] = []
-        itemHistory[r.bom_id].push(r)
-      })
-      levRes.rows.forEach(r => { itemUpdateLevels[r.bom_id] = r.update_level })
-    } catch (_) {}
-
-    // TGT Part No. history (migration_002)
-    let tgtHistory = []
-    let tgtUpdateLevel = 0
-    try {
-      const [tgtHRes, tgtLRes] = await Promise.all([
-        pool.query(
-          `SELECT introduced_at, superseded_at, old_tg_part_no
-           FROM tg.design_spec_tgt_history
-           WHERE design_spec_id = $1
-           ORDER BY superseded_at`,
-          [req.params.id]
-        ),
-        pool.query(
-          'SELECT tgt_update_level FROM tg.design_spec WHERE design_spec_id = $1',
-          [req.params.id]
-        ),
-      ])
-      tgtHistory = tgtHRes.rows
-      tgtUpdateLevel = tgtLRes.rows[0]?.tgt_update_level ?? 0
-    } catch (_) {}
-
-    const enrichedItems = items.map(item => ({
-      ...item,
-      update_level: itemUpdateLevels[item.id] ?? 0,
-      history: itemHistory[item.id] ?? [],
-    }))
-
-    // Saved Part No. views (migration_016 — skip if not yet applied)
-    let views = []
-    try {
-      const { rows } = await pool.query(
-        `SELECT id, key_code, name, part_nos, created_by,
-                to_char(created_at,'DD-Mon-YY') AS created
-         FROM tg.bom_view WHERE design_spec_id = $1 ORDER BY id`,
-        [req.params.id]
-      )
-      views = rows
-    } catch (_) {}
-
-    res.json({
-      ...h[0],
-      tgt_history: tgtHistory,
-      tgt_update_level: tgtUpdateLevel,
-      revisions,
-      items: enrichedItems,
-      views,
-    })
+    const bom = await buildBomObject(req.params.id)
+    if (!bom) return res.status(404).json({ error: 'BOM not found' })
+    res.json(bom)
   } catch (e) {
     res.status(500).json({ error: e.message })
   }
+})
+
+// ── BOM version snapshots (History tab) ──
+// GET /api/bom/:id/versions  — list saved snapshots (metadata only)
+router.get('/:id/versions', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, version_label, eci_no, created_by,
+              to_char(created_at AT TIME ZONE 'Asia/Bangkok','DD-Mon-YY HH24:MI') AS created_at
+       FROM tg.bom_version WHERE design_spec_id = $1 ORDER BY id DESC`, [req.params.id])
+    res.json(rows)
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// GET /api/bom/:id/versions/:vid  — full snapshot of one version (for read-only viewing)
+router.get('/:id/versions/:vid', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT snapshot FROM tg.bom_version WHERE id = $1 AND design_spec_id = $2`,
+      [req.params.vid, req.params.id])
+    if (!rows.length) return res.status(404).json({ error: 'version not found' })
+    res.json(rows[0].snapshot)
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// ── Custom Excel export template (per-BOM) ──
+// POST /api/bom/:id/template — upload a blank Excel BOM form to use as the export template
+router.post('/:id/template', uploadTemplate.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' })
+  const url = `/uploads/templates-custom/${req.file.filename}`
+  try {
+    const { rows } = await pool.query('SELECT custom_template_url FROM tg.design_spec WHERE design_spec_id=$1', [req.params.id])
+    await pool.query('UPDATE tg.design_spec SET custom_template_url=$1 WHERE design_spec_id=$2', [url, req.params.id])
+    const old = rows[0]?.custom_template_url
+    if (old) { try { fs.unlinkSync(path.join(__dirname, '../../', old)) } catch { /* ignore */ } }
+    res.json({ custom_template_url: url, filename: req.file.originalname })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// DELETE /api/bom/:id/template — remove custom template, revert to default he/bag form
+router.delete('/:id/template', async (req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT custom_template_url FROM tg.design_spec WHERE design_spec_id=$1', [req.params.id])
+    await pool.query('UPDATE tg.design_spec SET custom_template_url=NULL WHERE design_spec_id=$1', [req.params.id])
+    const old = rows[0]?.custom_template_url
+    if (old) { try { fs.unlinkSync(path.join(__dirname, '../../', old)) } catch { /* ignore */ } }
+    res.json({ ok: true })
+  } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
 // POST /api/bom/:id/revision
@@ -368,6 +397,23 @@ router.post('/:id/revision', async (req, res) => {
   let pnChangeItems    = items.filter(i => i.new_part_no?.trim())
   const metaOnlyItems  = items.filter(i => !i.new_part_no?.trim() &&
     (i.new_part_name?.trim() || i.new_note?.trim() || i.new_quantity?.trim() || i.new_mass?.trim()))
+
+  // Snapshot the CURRENT (pre-update) BOM so the old version is viewable in History.
+  // Done before any change; failure here must not block the revision.
+  try {
+    const snap = await buildBomObject(dsId)
+    if (snap) {
+      await pool.query(
+        `INSERT INTO tg.bom_version (design_spec_id, version_label, eci_no, snapshot, created_by)
+         VALUES ($1,$2,$3,$4,$5)`,
+        [dsId,
+         snap.revisions?.length ? `Rev ${snap.revisions.length}` : 'First issue',
+         snap.internal_eci_no ?? null,
+         JSON.stringify(snap),
+         req.user?.full_name || req.user?.username || null]
+      )
+    }
+  } catch (e) { console.error('snapshot failed:', e.message) }
 
   const client = await pool.connect()
   try {

@@ -165,7 +165,7 @@ function Cols({ maxLevel = 5 }) {
   )
 }
 
-export default function BomDocumentView({ bom, onRefresh }) {
+export default function BomDocumentView({ bom, onRefresh, readOnly = false }) {
   const pageRefs = useRef([])
   const [busy, setBusy] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -177,6 +177,27 @@ export default function BomDocumentView({ bom, onRefresh }) {
   const [showApprovalDialog, setShowApprovalDialog] = useState(false)
   const [approvalEmail, setApprovalEmail] = useState('')
   const [approvalStatus, setApprovalStatus] = useState(null) // null | 'sending' | 'ok' | 'err:...'
+  const tplRef = useRef(null)
+  const [tplBusy, setTplBusy] = useState(false)
+
+  async function uploadTemplate(file) {
+    if (!file) return
+    if (!/\.xlsx$/i.test(file.name)) { alert('Please select an .xlsx file'); return }
+    setTplBusy(true)
+    try {
+      const fd = new FormData(); fd.append('file', file)
+      const r = await fetch(`/api/bom/${bom.id}/template`, { method: 'POST', body: fd })
+      if (!r.ok) throw new Error((await r.json()).error)
+      await onRefresh?.()
+    } catch (e) { alert('Upload failed: ' + e.message) }
+    finally { setTplBusy(false); if (tplRef.current) tplRef.current.value = '' }
+  }
+  async function removeTemplate() {
+    if (!window.confirm('Remove custom Excel template? Export will use the default form.')) return
+    setTplBusy(true)
+    try { await fetch(`/api/bom/${bom.id}/template`, { method: 'DELETE' }); await onRefresh?.() }
+    catch (_) { /* ignore */ } finally { setTplBusy(false) }
+  }
 
   async function doRefresh() {
     if (busy || saving || refreshing) return
@@ -575,7 +596,7 @@ export default function BomDocumentView({ bom, onRefresh }) {
 {/*When only 1 page, show it. When multiple pages, show the active one (default first)*/}
   return (
     <div className="bdv-wrap">
-      <div className="bdv-toolbar">
+      <div className="bdv-toolbar" style={readOnly ? { display: 'none' } : undefined}>
         {/* left — save + reset + approval */}
         <button className="bdv-btn bdv-btn--secondary" onClick={saveHeader} disabled={saving || busy || !headerDirty}>
           {saving ? 'Saving…' : '💾 Save'}
@@ -619,6 +640,25 @@ export default function BomDocumentView({ bom, onRefresh }) {
           </svg>
           Excel
         </button>
+
+        {/* Custom Excel template (per-BOM export form) */}
+        <input ref={tplRef} type="file" accept=".xlsx" style={{ display: 'none' }}
+          onChange={e => uploadTemplate(e.target.files[0])} />
+        {bom.custom_template_url ? (
+          <span className="bdv-tpl bdv-tpl--on" title="Excel export uses your uploaded template">
+            <span className="bdv-tpl-dot" /> Custom form
+            <button className="bdv-tpl-x" onClick={removeTemplate} disabled={tplBusy} title="Remove custom template">✕</button>
+          </span>
+        ) : (
+          <button className="bdv-btn bdv-btn--tpl" onClick={() => tplRef.current?.click()} disabled={tplBusy || saving}
+            title="Import a blank Excel BOM form to use as this BOM's export template">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><polyline points="9 15 12 12 15 15"/>
+            </svg>
+            {tplBusy ? '…' : 'Template'}
+          </button>
+        )}
+
         <button className="bdv-btn bdv-btn--matrix" onClick={() => exportBomMatrix(bom)} disabled={busy || saving} title="Export Matrix Component Part Detail">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/>

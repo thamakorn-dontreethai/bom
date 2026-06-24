@@ -159,6 +159,22 @@ const NAV_TABS = [
 
 const BOM_GROUPS = ['PP', 'AL', 'ASSY', 'BAG', 'Steering wheel']
 
+// Toast notifications (top-right). Used for real-time approval alerts.
+function ToastStack({ toasts, onClose }) {
+  if (!toasts?.length) return null
+  return (
+    <div className="toast-stack">
+      {toasts.map(t => (
+        <div key={t.id} className={`toast toast--${t.kind ?? 'info'}`} onClick={() => onClose(t.id)}>
+          <div className="toast-title">{t.title}</div>
+          {t.body && <div className="toast-body">{t.body}</div>}
+          <button className="toast-x" onClick={e => { e.stopPropagation(); onClose(t.id) }}>✕</button>
+        </div>
+      ))}
+    </div>
+  )
+}
+
 // Install the fetch auth patch once, before any component fetches
 installFetchAuth(() => { window.__bomLogout?.() })
 
@@ -183,9 +199,58 @@ export default function App() {
   const [pasteUploading, setPasteUploading] = useState(false)
   const [pasteError, setPasteError] = useState(null)
   const fileRef = useRef(null)
+  const [toasts, setToasts] = useState([])          // in-app notifications
+  const lastApprovalTs = useRef(null)               // newest approval ts already seen
+  function pushToast(t) {
+    const id = Date.now() + Math.random()
+    setToasts(ts => [...ts, { id, ...t }])
+    setTimeout(() => setToasts(ts => ts.filter(x => x.id !== id)), t.ttl ?? 8000)
+  }
 
   // Let the fetch-auth patch force logout on 401
   useEffect(() => { window.__bomLogout = () => setUser(null); return () => { delete window.__bomLogout } }, [])
+
+  // Real-time approval alerts: poll the activity feed; when a NEW "approve" event
+  // appears, pop an in-app toast + a browser notification. (Browsers throttle this in
+  // background tabs but fire as soon as the tab is focused again.)
+  useEffect(() => {
+    if (!user) return
+    if ('Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission().catch(() => {})
+    }
+    let stop = false
+    const check = async () => {
+      try {
+        const r = await fetch('/api/auth/activity?limit=15')
+        if (!r.ok) return
+        const list = await r.json()
+        const approvals = list.filter(a => a.action === 'approve')
+        if (!approvals.length) return
+        const newestTs = Number(approvals[0].ts)
+        if (lastApprovalTs.current === null) { lastApprovalTs.current = newestTs; return } // baseline, don't alert old ones
+        const fresh = approvals.filter(a => Number(a.ts) > lastApprovalTs.current)
+        if (fresh.length) {
+          lastApprovalTs.current = newestTs
+          fresh.reverse().forEach(a => {
+            const title = '✅ BOM Approved'
+            const body = `${a.target ?? ''} — approved by ${a.user_name}`
+            pushToast({ kind: 'approve', title, body })
+            if ('Notification' in window && Notification.permission === 'granted') {
+              try { new Notification(title, { body, tag: `appr-${a.id}` }) } catch (_) {}
+            }
+          })
+          // Refresh the home cards + stats so the "✓ Approved" badge appears automatically
+          // (the document view updates itself live via its own SSE connection).
+          loadList()
+        }
+      } catch (_) {}
+    }
+    check()
+    const iv = setInterval(() => { if (!stop) check() }, 5000)
+    const onVis = () => { if (document.visibilityState === 'visible') check() }
+    document.addEventListener('visibilitychange', onVis)
+    return () => { stop = true; clearInterval(iv); document.removeEventListener('visibilitychange', onVis) }
+  }, [user])
 
   // Load the BOM list on mount / after login
   useEffect(() => { if (user) loadList() }, [user])
@@ -366,9 +431,23 @@ export default function App() {
     </div>
   )
 
+  // Floating in-app notifications (e.g. BOM approved) — shown on every logged-in view
+  const toastStack = toasts.length > 0 && (
+    <div className="toast-stack">
+      {toasts.map(t => (
+        <div key={t.id} className={`toast toast--${t.kind ?? 'info'}`}
+          onClick={() => setToasts(ts => ts.filter(x => x.id !== t.id))}>
+          <div className="toast-title">{t.title}</div>
+          {t.body && <div className="toast-body">{t.body}</div>}
+        </div>
+      ))}
+    </div>
+  )
+
   /* ── Admin full-page view ── */
   if (view === 'admin' && user.role === 'admin') return (
     <div className="shell">
+      {toastStack}
       <div className="shell-topbar">
         <span className="shell-logo">BOM</span>
         <span className="shell-title">BILL OF MATERIAL · Toyoda Gosei</span>
@@ -387,6 +466,7 @@ export default function App() {
       onDragOver={e => e.preventDefault()}
     >
       <input ref={fileRef} type="file" accept=".pdf" style={{ display: 'none' }} onChange={e => handleFile(e.target.files[0])} />
+      {toastStack}
          {/*tapbar*/}
       <div className="shell-topbar">
         <span className="shell-logo">BOM</span>
@@ -575,15 +655,19 @@ export default function App() {
                          b.model?.toLowerCase().includes(q)
                 }).map(b => {
                   const live = presence[b.id]?.length > 0
+                  const isApproved = b.approved_by && String(b.approved_by).trim()
                   return (
                   <div key={b.id}
-                    className={`home-card${live ? ' home-card--live' : ''}`}
+                    className={`home-card${live ? ' home-card--live' : ''}${isApproved ? ' home-card--approved' : ''}`}
                     title={live ? `Working: ${presence[b.id].join(', ')}` : undefined}
                     onClick={() => selectBom(b.id)}>
                     <div className="home-card-accent" />
                     <div className="hc-part">
                       <span className="hc-icon">📄</span>
                       <span className="hc-pn">{b.tg_part_no ?? b.customer_part_no}</span>
+                      {isApproved && (
+                        <span className="hc-approved-badge" title={`Approved by ${b.approved_by}`}>✓ Approved</span>
+                      )}
                       {live && (
                         <span className="hc-live-avatars" title={`Working: ${presence[b.id].join(', ')}`}>
                           {presence[b.id].slice(0, 2).map((n, i) => (
@@ -646,6 +730,8 @@ export default function App() {
       )}
 
       {uploading && <ImportProgress />}
+
+      <ToastStack toasts={toasts} onClose={id => setToasts(ts => ts.filter(x => x.id !== id))} />
 
       {showPasteModal && (
         <div className="paste-overlay" onClick={() => setShowPasteModal(false)}>
@@ -727,6 +813,7 @@ export default function App() {
   /* ── BOM screens Document View──────────────────────────────────────────── */
   return (
     <div className="shell">
+      {toastStack}
       <div className="shell-topbar">
         <span className="shell-logo">BOM</span>
         <span className="shell-title">BILL OF MATERIAL · Toyoda Gosei</span>
@@ -757,6 +844,7 @@ export default function App() {
           {view === 'export'   && <BomExport bom={bom} />}
         </>)}
       </div>
+      <ToastStack toasts={toasts} onClose={id => setToasts(ts => ts.filter(x => x.id !== id))} />
     </div>
   )
 }

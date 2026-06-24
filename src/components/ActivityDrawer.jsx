@@ -6,6 +6,7 @@ const ACT_FILTERS = [
   { id: 'inout', label: <><IconSignInOut /> Sign in/out</>, actions: ['login', 'logout'] },
   { id: 'add', label: <><IconPlus /> Added</>, actions: ['import', 'revise'] },
   { id: 'edit', label: <><IconPencil /> Edited</>, actions: ['edit'] },
+  { id: 'approve', label: <>Approved</>, actions: ['approve'] },
   { id: 'remove', label: <><IconTrash /> Deleted</>, actions: ['delete'] },
 ]
 

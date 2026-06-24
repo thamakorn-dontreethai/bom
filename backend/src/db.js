@@ -235,6 +235,24 @@ export async function initDb() {
   `)
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_activity_created ON tg.activity_log(created_at DESC)`)
 
+  // migration_018 — BOM version snapshots: a full copy of the BOM saved BEFORE each
+  // revision, so old versions can be viewed (read-only) in the History tab.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tg.bom_version (
+      id             BIGSERIAL PRIMARY KEY,
+      design_spec_id BIGINT NOT NULL,
+      version_label  TEXT,
+      eci_no         TEXT,
+      snapshot       JSONB NOT NULL,
+      created_by     VARCHAR(120),
+      created_at     TIMESTAMPTZ DEFAULT NOW()
+    )
+  `)
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_bom_version_ds ON tg.bom_version(design_spec_id, id DESC)`)
+
+  // migration_019 — per-BOM custom Excel export template (uploaded blank form)
+  await pool.query(`ALTER TABLE tg.design_spec ADD COLUMN IF NOT EXISTS custom_template_url TEXT`)
+
   // Seed a default admin if no admin exists yet (admin/admin1234)
   const { rows: adminRows } = await pool.query("SELECT COUNT(*) AS cnt FROM tg.users WHERE role='admin'")
   if (parseInt(adminRows[0].cnt) === 0) {
