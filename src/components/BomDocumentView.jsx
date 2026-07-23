@@ -8,10 +8,9 @@ import { exportBomToExcel } from '../utils/exportBomExcel'
 function findActiveReplacement(revisedOut, items) {
   let current = revisedOut
   while (current && current.status === 'revised_out') {
-    current = items.find(r =>
-      r.sort_order === current.sort_order + 1 &&
-      r.parent_id === current.parent_id
-    ) ?? null
+    current = items
+      .filter(r => r.sort_order > current.sort_order && r.parent_id === current.parent_id)
+      .sort((a, b) => a.sort_order - b.sort_order)[0] ?? null
   }
   return current
 }
@@ -58,57 +57,56 @@ function flatten(nodes) {
   return out
 }
 
-// Place each revised_out chain immediately before the final active replacement.
-// Example: A(revised)→B(revised)→C(active) inserts [A, B] right before C.
+// For each revised_out item, follow the chain to find the final active successor,
+// then place ALL revised_out predecessors (sorted oldest-first) before that active item.
+// For Level 1 active items with customer_part_no, inject a synthetic _custPnOnly header
+// row BEFORE the struck rows so customer_pn always appears first, never struck through.
 function insertRevisedOut(flatRows, allItems) {
-  function followChain(start) {
-    const chain = []
-    let current = start
-    while (current && current.status === 'revised_out') {
-      chain.push(current)
-      current = allItems.find(r =>
-        r.sort_order === current.sort_order + 1 &&
-        r.parent_id === current.parent_id
-      ) ?? null
-    }
-    return { chain, finalRep: current }
-  }
-
   const insertBefore = {}
-  const processedIds = new Set()
 
   allItems.forEach(it => {
-    if (it.status !== 'revised_out' || processedIds.has(it.id) || it.sort_order == null) return
-    // Only start at chain roots (skip items that are already covered by an earlier chain member)
-    const hasPrev = allItems.some(r =>
-      r.status === 'revised_out' &&
-      r.sort_order === it.sort_order - 1 &&
-      r.parent_id === it.parent_id
-    )
-    if (hasPrev) return
-
-    const { chain, finalRep } = followChain(it)
-    chain.forEach(c => processedIds.add(c.id))
-    if (finalRep) {
-      if (!insertBefore[finalRep.id]) insertBefore[finalRep.id] = []
-      insertBefore[finalRep.id].push(...chain)
+    if (it.status !== 'revised_out' || it.sort_order == null) return
+    // Follow chain to find the final active successor
+    let finalActive = allItems
+      .filter(r => r.sort_order > it.sort_order && r.parent_id === it.parent_id)
+      .sort((a, b) => a.sort_order - b.sort_order)[0] ?? null
+    while (finalActive && finalActive.status === 'revised_out') {
+      finalActive = allItems
+        .filter(r => r.sort_order > finalActive.sort_order && r.parent_id === finalActive.parent_id)
+        .sort((a, b) => a.sort_order - b.sort_order)[0] ?? null
+    }
+    if (finalActive) {
+      if (!insertBefore[finalActive.id]) insertBefore[finalActive.id] = []
+      insertBefore[finalActive.id].push(it)
     }
   })
+  // Sort each group oldest-first by sort_order
+  Object.values(insertBefore).forEach(arr => arr.sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0)))
 
   const result = []
   const placed = new Set()
   for (const row of flatRows) {
     if (row?.id != null && insertBefore[row.id]) {
+      const lv = row.level ?? row.bom_level ?? 1
+      const hasCust = lv === 1 && !!row.customer_part_no && row.status !== 'revised_out'
+      if (hasCust) {
+        // Inject customer_pn header BEFORE struck rows — never struck, always first
+        result.push({ ...row, _custPnOnly: true })
+      }
       for (const ro of insertBefore[row.id]) {
         result.push(ro)
         placed.add(ro.id)
       }
+      // Active item skips re-rendering its customer_pn (already injected above)
+      result.push(hasCust ? { ...row, _skipCustPn: true } : row)
+    } else {
+      result.push(row)
     }
-    result.push(row)
   }
-  // Any revised_out whose replacement wasn't on this page — append at end
+  // Revised_out items with no active successor: append at end
   allItems.forEach(it => {
-    if (it.status === 'revised_out' && !placed.has(it.id)) result.push(it)
+    if (it.status !== 'revised_out' || placed.has(it.id)) return
+    result.push(it)
   })
   return result
 }
@@ -217,6 +215,7 @@ export default function BomDocumentView({ bom, onRefresh }) {
   const [saveMsg, setSaveMsg] = useState(null)
   const [refreshing, setRefreshing] = useState(false)
   const [blinking, setBlinking] = useState(false)
+  const [showExcelMenu, setShowExcelMenu] = useState(false)
   const [showRevDialog, setShowRevDialog] = useState(false)
   const [showApprovalDialog, setShowApprovalDialog] = useState(false)
   const [approvalEmail, setApprovalEmail] = useState('')
@@ -310,10 +309,20 @@ export default function BomDocumentView({ bom, onRefresh }) {
     }
   }
 
+  function showAllPages() {
+    pageRefs.current.filter(Boolean).forEach(el => { el.style.display = 'block' })
+  }
+  function restorePages() {
+    pageRefs.current.filter(Boolean).forEach((el, i) => {
+      el.style.display = pages[i]?.key === effectiveKey ? 'block' : 'none'
+    })
+  }
+
   async function download() {
     const refs = pageRefs.current.filter(Boolean)
     if (!refs.length) return
     setBusy(true)
+    showAllPages()
     try {
       const pdf = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a3' })
       const pw = pdf.internal.pageSize.getWidth()
@@ -379,11 +388,13 @@ export default function BomDocumentView({ bom, onRefresh }) {
     } catch (e) {
       console.error('PDF error', e)
     } finally {
+      restorePages()
       setBusy(false)
     }
   }
 
   async function generatePdfBase64() {
+    showAllPages()
     const refs = pageRefs.current.filter(Boolean)
     if (!refs.length) return null
     const pdf = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a3' })
@@ -433,12 +444,14 @@ export default function BomDocumentView({ bom, onRefresh }) {
       const ratio2 = canvas.height / canvas.width
       pdf.addImage(canvas.toDataURL('image/jpeg', 0.92), 'JPEG', margin, margin, availW, availW * ratio2)
     }
-    return await new Promise((resolve, reject) => {
+    const result = await new Promise((resolve, reject) => {
       const reader = new FileReader()
       reader.onload = () => resolve(reader.result.replace(/^data:application\/pdf;base64,/, ''))
       reader.onerror = reject
       reader.readAsDataURL(pdf.output('blob'))
     })
+    restorePages()
+    return result
   }
 
   async function sendApproval() {
@@ -460,6 +473,8 @@ export default function BomDocumentView({ bom, onRefresh }) {
   const groups = groupByKey(bom.items ?? [])
   const pages = groups.length > 0 ? groups : [{ key: '0', label: '', rows: [] }]
   const total = pages.length
+  const [activeKey, setActiveKey] = useState(null)
+  const effectiveKey = activeKey ?? pages[0]?.key ?? '0'
 
   return (
     <div className="bdv-wrap">
@@ -471,10 +486,7 @@ export default function BomDocumentView({ bom, onRefresh }) {
         <button className="bdv-btn bdv-btn--rev" onClick={() => setShowRevDialog(true)} disabled={busy || saving}>
           บันทึก Update
         </button>
-
         <div className="bdv-toolbar-sep" />
-
-        {/* group 2 — danger */}
         <button
           className="bdv-btn bdv-btn--danger"
           disabled={busy || saving}
@@ -486,16 +498,42 @@ export default function BomDocumentView({ bom, onRefresh }) {
         >
           ↺ Reset
         </button>
-
         <div className="bdv-toolbar-sep" />
 
-        {/* group 3 — export */}
+        {/* group 2 — export */}
         <button className="bdv-btn" onClick={download} disabled={busy || saving}>
           {busy ? 'กำลัง Generate…' : '⬇ PDF'}
         </button>
-        <button className="bdv-btn bdv-btn--excel" onClick={() => exportBomToExcel(bom)} disabled={busy || saving}>
-          📊 Excel
-        </button>
+        <div style={{ position: 'relative', display: 'inline-block' }}>
+          <button
+            className="bdv-btn bdv-btn--excel"
+            disabled={busy || saving}
+            onClick={() => {
+              if (pages.length <= 1) { exportBomToExcel(bom, 'all'); return }
+              setShowExcelMenu(v => !v)
+            }}
+          >
+            📊 Excel{pages.length > 1 ? ' ▾' : ''}
+          </button>
+          {showExcelMenu && pages.length > 1 && (
+            <div
+              style={{ position:'absolute', top:'100%', left:0, background:'#fff', border:'1px solid #ccc', borderRadius:4, boxShadow:'0 2px 8px rgba(0,0,0,.15)', zIndex:100, minWidth:120 }}
+              onMouseLeave={() => setShowExcelMenu(false)}
+            >
+              {pages.map(p => (
+                <div
+                  key={p.key}
+                  style={{ padding:'6px 14px', cursor:'pointer', fontSize:12, whiteSpace:'nowrap' }}
+                  onMouseEnter={e => e.currentTarget.style.background='#f0f4ff'}
+                  onMouseLeave={e => e.currentTarget.style.background=''}
+                  onClick={() => { exportBomToExcel(bom, p.key); setShowExcelMenu(false) }}
+                >
+                  Key {p.key}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
 
         <div className="bdv-toolbar-sep" />
 
@@ -519,49 +557,119 @@ export default function BomDocumentView({ bom, onRefresh }) {
 
       {/* ── Approval dialog ── */}
       {showApprovalDialog && (
-        <div className="bdv-overlay" onClick={() => setShowApprovalDialog(false)}>
-          <div className="bdv-dialog" onClick={e => e.stopPropagation()}>
-            <div className="bdv-dialog-title">✉️ ส่ง Link ขออนุมัติ</div>
-            <div className="bdv-dialog-sub">ระบบจะส่ง email พร้อม link ให้ผู้รับกรอกชื่อใน Approved by</div>
-            {approvalStatus === 'ok'
-              ? <div className="bdv-dialog-ok">✅ ส่ง email เรียบร้อยแล้ว</div>
-              : approvalStatus?.startsWith('err')
-                ? <div className="bdv-dialog-err">⚠️ ส่งไม่สำเร็จ<br/><span style={{fontSize:11,wordBreak:'break-all'}}>{approvalStatus.slice(4)}</span></div>
-                : <>
-                    <label className="bdv-dialog-label">Email ผู้อนุมัติ</label>
-                    <input
-                      className="bdv-dialog-input"
-                      type="email"
-                      placeholder="approver@example.com"
-                      value={approvalEmail}
-                      onChange={e => setApprovalEmail(e.target.value)}
-                      onKeyDown={e => e.key === 'Enter' && sendApproval()}
-                      autoFocus
-                    />
-                  </>
-            }
-            <div className="bdv-dialog-actions">
-              <button className="bdv-btn" onClick={() => setShowApprovalDialog(false)}>ปิด</button>
-              {approvalStatus !== 'ok' && (
-                <button
-                  className="bdv-btn bdv-btn--approval"
-                  disabled={approvalStatus === 'sending' || !approvalEmail}
-                  onClick={sendApproval}
-                >
-                  {approvalStatus === 'sending' ? 'กำลังส่ง…' : 'ส่ง Email'}
-                </button>
+        <div className="bdv-overlay">
+          <div className="apv-dialog">
+
+            {/* Header */}
+            <div className="apv-header">
+              <div className="apv-header-icon">✉</div>
+              <div>
+                <div className="apv-header-title">ส่งขออนุมัติ BOM</div>
+                <div className="apv-header-sub">ระบบจะส่ง link ให้ผู้รับกรอกลายเซ็นใน Approved by</div>
+              </div>
+              {approvalStatus !== 'sending' && (
+                <button className="apv-close" onClick={() => setShowApprovalDialog(false)}>✕</button>
               )}
             </div>
+
+            {/* BOM context chip */}
+            <div className="apv-context">
+              <span className="apv-context-label">เอกสาร</span>
+              <span className="apv-context-val">{bom.tg_part_no ?? bom.customer_part_no}</span>
+              <span className="apv-context-dot">·</span>
+              <span className="apv-context-val">{bom.model}</span>
+              <span className="apv-context-dot">·</span>
+              <span className="apv-context-val">{bom.customer_name ?? bom.customer}</span>
+            </div>
+
+            {/* Body */}
+            {approvalStatus === 'ok' ? (
+              <div className="apv-success">
+                <div className="apv-success-icon">✓</div>
+                <div className="apv-success-title">ส่ง Email เรียบร้อยแล้ว</div>
+                <div className="apv-success-sub">ส่งไปที่ <b>{approvalEmail}</b></div>
+                <button className="apv-btn apv-btn--primary" style={{marginTop:20}} onClick={() => setShowApprovalDialog(false)}>
+                  ปิด
+                </button>
+              </div>
+            ) : approvalStatus?.startsWith('err') ? (
+              <div className="apv-error-body">
+                <div className="apv-error-icon">⚠</div>
+                <div className="apv-error-title">ส่งไม่สำเร็จ</div>
+                <div className="apv-error-msg">{approvalStatus.slice(4)}</div>
+                <div className="apv-actions">
+                  <button className="apv-btn apv-btn--secondary" onClick={() => setShowApprovalDialog(false)}>ปิด</button>
+                  <button className="apv-btn apv-btn--primary" onClick={() => setApprovalStatus(null)}>ลองใหม่</button>
+                </div>
+              </div>
+            ) : (
+              <div className="apv-form">
+                <label className="apv-label">
+                  Email ผู้อนุมัติ
+                  <span className="apv-required">*</span>
+                </label>
+                <div className={`apv-input-wrap${approvalEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(approvalEmail) ? ' apv-input-wrap--err' : ''}`}>
+                  <span className="apv-input-icon">@</span>
+                  <input
+                    className="apv-input"
+                    type="email"
+                    placeholder="approver@company.com"
+                    value={approvalEmail}
+                    onChange={e => setApprovalEmail(e.target.value)}
+                    onKeyDown={e => e.key === 'Enter' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(approvalEmail) && sendApproval()}
+                    autoFocus
+                    disabled={approvalStatus === 'sending'}
+                  />
+                </div>
+                {approvalEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(approvalEmail) && (
+                  <div className="apv-input-hint">รูปแบบ email ไม่ถูกต้อง</div>
+                )}
+
+                <div className="apv-actions">
+                  <button className="apv-btn apv-btn--secondary" onClick={() => setShowApprovalDialog(false)} disabled={approvalStatus === 'sending'}>
+                    ยกเลิก
+                  </button>
+                  <button
+                    className="apv-btn apv-btn--primary"
+                    disabled={approvalStatus === 'sending' || !approvalEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(approvalEmail)}
+                    onClick={sendApproval}
+                  >
+                    {approvalStatus === 'sending'
+                      ? <><span className="apv-spinner" /> กำลังส่ง…</>
+                      : <>✉ ส่ง Email</>}
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}
+      {pages.length > 1 && (
+        <div className="tree-keys" style={{ padding: '8px 16px 0' }}>
+          {pages.map(p => (
+            <button
+              key={p.key}
+              className={`tree-key-btn${effectiveKey === p.key ? ' active' : ''}`}
+              onClick={() => setActiveKey(p.key)}
+            >
+              {p.label || `Key ${p.key}`}
+            </button>
+          ))}
+        </div>
+      )}
+
       <div className={`bdv-scroll${blinking ? ' bdv-scroll--refreshing' : ''}`} onAnimationEnd={() => setBlinking(false)}>
         {pages.map((g, idx) => {
           const rows = [...g.rows]
           const need = Math.max(0, MIN_ROWS - rows.length)
           for (let j = 0; j < need; j++) rows.push(null)
           return (
-            <div key={g.key} ref={el => { pageRefs.current[idx] = el }} className="bdv-paper">
+            <div
+              key={g.key}
+              ref={el => { pageRefs.current[idx] = el }}
+              className="bdv-paper"
+              style={{ display: g.key === effectiveKey ? 'block' : 'none' }}
+            >
               <BomPage
                 bom={bom}
                 header={header}
@@ -602,7 +710,7 @@ export default function BomDocumentView({ bom, onRefresh }) {
    └─ cols 21-25 recie / code / kanban / lead / remark (26 30 30 28 36)
 ───────────────────────────────────────────────────────── */
 function BomPage({ bom, header, onToggle, onField, revNames, setRevName, rows, pageNum, totalPages }) {
-  const pageLv1 = rows.find(r => r && r.level === 1)
+  const pageLv1 = rows.find(r => r && r.level === 1 && r.status !== 'revised_out')
   const pageTgPartNo = pageLv1?.tg_part_no ?? bom.tg_part_no
   const rawRevs = bom.revisions ?? []
   const hasFirstIssue = rawRevs.some(r => !r.mark || r.mark === '–' || r.mark === '-')
@@ -971,13 +1079,49 @@ function BomRow({ row }) {
   const isRevisedOut = row.status === 'revised_out'
   const displayLevel = isRevisedOut ? updateLevel - 1 : updateLevel
 
+  const rawNote = row.note ?? ''
+  const noteQty  = rawNote.match(/Q'ty:\s*([^|]+)/)?.[1]?.trim() ?? null
+  const noteMass = rawNote.match(/Weight:\s*([^|]+)/)?.[1]?.trim() ?? null
+  const cleanNote = rawNote
+    .replace(/Q'ty:\s*[^|]+\|?\s*/g, '')
+    .replace(/Weight:\s*[^|]+\|?\s*/g, '')
+    .trim().replace(/\|\s*$/, '').trim()
+
+  const displayQty  = noteQty  ?? (row.quantity != null ? Math.round(row.quantity) : '')
+  const displayMass = noteMass ?? (row.mass_g   != null ? Number(row.mass_g).toLocaleString() : '')
+
   const spec = [
-    row.note,
+    cleanNote || null,
     row.product_standards && row.product_standards !== 'NO' ? row.product_standards : null,
     row.material_standards && row.material_standards !== 'NO' ? row.material_standards : null,
   ].filter(Boolean).join('  ')
 
-  const hasCustPn = lv === 1 && !!row.customer_part_no
+  // Synthetic customer_pn-only header row (injected by insertRevisedOut)
+  // Renders the customer_part_no line without struck-through styling, always first.
+  if (row._custPnOnly) {
+    return (
+      <tr className={`bp-row bp-row-lv${lv}`}>
+        {[1,2,3,4,5].map(n => (
+          <td key={n} className={`bp-td bp-td-pn bp-td-pn${n}`}>
+            {n === 1 ? <div className="bp-pn-cell"><span>{row.customer_part_no}</span></div> : ''}
+          </td>
+        ))}
+        <td className="bp-td bp-td-name">{row.part_name}</td>
+        <td className="bp-td bp-td-spec">{spec}</td>
+        <td className="bp-td bp-td-c">{displayQty}</td>
+        <td className="bp-td bp-td-c">{displayMass}</td>
+        <td className="bp-td bp-td-c" /><td className="bp-td bp-td-c" />
+        {[0,1,2,3,4].map(i => <td key={i} className="bp-td bp-td-c" />)}
+        {[0,1,2,3].map(i => <td key={i} className="bp-td bp-td-c" />)}
+        <td className="bp-td bp-td-c" /><td className="bp-td bp-td-c" />
+        <td className="bp-td bp-td-c" /><td className="bp-td bp-td-c" />
+        <td className="bp-td bp-td-remark" />
+      </tr>
+    )
+  }
+
+  // _skipCustPn: customer_pn was already injected as a header row above the struck rows
+  const hasCustPn = lv === 1 && !!row.customer_part_no && !isRevisedOut && !row._skipCustPn
   const trClass = `bp-row bp-row-lv${lv}${isRevisedOut ? ' bp-row-revised-out' : ''}`
 
   return (
@@ -999,8 +1143,8 @@ function BomRow({ row }) {
         ))}
         <td className="bp-td bp-td-name">{row.part_name}</td>
         <td className="bp-td bp-td-spec">{spec}</td>
-        <td className="bp-td bp-td-c">{row.quantity != null ? Math.round(row.quantity) : ''}</td>
-        <td className="bp-td bp-td-c">{row.mass_g != null ? Number(row.mass_g).toLocaleString() : ''}</td>
+        <td className="bp-td bp-td-c">{displayQty}</td>
+        <td className="bp-td bp-td-c">{displayMass}</td>
         <td className="bp-td bp-td-c" /><td className="bp-td bp-td-c" />
         {[0,1,2,3,4].map(i => <td key={i} className="bp-td bp-td-c" />)}
         {[0,1,2,3].map(i => <td key={i} className="bp-td bp-td-c" />)}
@@ -1060,7 +1204,15 @@ function RevisionDialog({ bom, onClose, onDone }) {
   const [pdfError, setPdfError] = useState(null)
   const fileRef = useRef(null)
 
-  const allItems = (bom.items ?? []).filter(it => it.tg_part_no)
+  const allItems = (bom.items ?? []).filter(it => it.tg_part_no && it.status !== 'revised_out')
+  const allKeys = [...new Set(allItems.flatMap(it => parseKeyList(it.key_code)))].sort((a, b) => a - b).map(String)
+  const [activeRevKey, setActiveRevKey] = useState(allKeys[0] ?? null)
+  const visibleItems = activeRevKey
+    ? allItems.filter(it => {
+        const ks = parseKeyList(it.key_code)
+        return ks.length === 0 || ks.map(String).includes(activeRevKey)
+      })
+    : allItems
 
   async function onPdfFile(file) {
     if (!file?.name.toLowerCase().endsWith('.pdf')) {
@@ -1075,24 +1227,35 @@ function RevisionDialog({ bom, onClose, onDone }) {
       setPreview(data)
       if (data.header?.internal_eci_no) setEciNo(data.header.internal_eci_no)
       if (data.tgt_change) setNewTgt(data.tgt_change.new)
-      // Pre-fill item_changes into itemUpdates
+      // Pre-fill item_changes into itemUpdates — skip Lv1 (TGT Part No. changes handled separately)
       const updates = {}
       for (const ch of data.item_changes ?? []) {
-        updates[ch.bom_id] = ch.new_pn
+        if (ch.level === 1) continue
+        updates[ch.bom_id] = { pn: ch.new_pn, name: '', note: '', qty: '', mass: '' }
       }
       setItemUpdates(updates)
     } catch (e) { setPdfError(e.message) }
     finally { setPdfParsing(false) }
   }
 
-  function onItemChange(id, val) {
-    setItemUpdates(prev => ({ ...prev, [id]: val }))
+  function onItemChange(id, field, val) {
+    setItemUpdates(prev => ({
+      ...prev,
+      [id]: { ...(prev[id] ?? {}), [field]: val },
+    }))
   }
 
   async function submit() {
     const items = Object.entries(itemUpdates)
-      .filter(([, v]) => v.trim())
-      .map(([bom_id, new_part_no]) => ({ bom_id: parseInt(bom_id), new_part_no: new_part_no.trim() }))
+      .filter(([, v]) => v.pn?.trim() || v.name?.trim() || v.note?.trim() || v.qty?.trim() || v.mass?.trim())
+      .map(([bom_id, v]) => ({
+        bom_id: parseInt(bom_id),
+        new_part_no: v.pn?.trim() || null,
+        new_part_name: v.name?.trim() || null,
+        new_note: v.note?.trim() || null,
+        new_quantity: v.qty?.trim() || null,
+        new_mass: v.mass?.trim() || null,
+      }))
 
     if (!items.length && !newTgt.trim()) {
       setError('ไม่มีการเปลี่ยนแปลงใดๆ'); return
@@ -1122,7 +1285,7 @@ function RevisionDialog({ bom, onClose, onDone }) {
   }
 
   return (
-    <div className="rev-dlg-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+    <div className="rev-dlg-overlay">
       <div className="rev-dlg">
         <div className="rev-dlg__hdr">
           <span>△ บันทึก Update / Revision</span>
@@ -1258,25 +1421,80 @@ function RevisionDialog({ bom, onClose, onDone }) {
               </div>
 
               <div className="rev-dlg__section-title">
-                Part No. ที่เปลี่ยน — ระบุค่าใหม่เฉพาะรายการที่เปลี่ยน (เว้นว่างถ้าไม่เปลี่ยน)
+                แก้ไขข้อมูล Part — ระบุค่าใหม่เฉพาะรายการที่ต้องการเปลี่ยน (เว้นว่างถ้าไม่เปลี่ยน)
               </div>
-              <div className="rev-dlg__items">
-                <div className="rev-dlg__items-hdr">
-                  <span>Lv</span><span>Part No. ปัจจุบัน</span><span>Part Name</span><span>Part No. ใหม่</span>
+
+              {allKeys.length > 1 && (
+                <div className="tree-keys" style={{ marginBottom: 8 }}>
+                  {allKeys.map(k => (
+                    <button key={k} className={`tree-key-btn${activeRevKey === k ? ' active' : ''}`}
+                      onClick={() => setActiveRevKey(k)}>
+                      Key {k}
+                    </button>
+                  ))}
                 </div>
-                {allItems.map(item => (
-                  <div key={item.id} className="rev-dlg__item-row">
-                    <span className="rev-dlg__lv">{item.level}</span>
-                    <span className="rev-dlg__cur-pn">{item.tg_part_no}</span>
-                    <span className="rev-dlg__name">{item.part_name}</span>
-                    <input
-                      className="rev-dlg__new-pn"
-                      placeholder="ใส่ค่าใหม่…"
-                      value={itemUpdates[item.id] ?? ''}
-                      onChange={e => onItemChange(item.id, e.target.value)}
-                    />
-                  </div>
-                ))}
+              )}
+
+              <div className="rev-dlg__items">
+                {visibleItems.map(item => {
+                  const v = itemUpdates[item.id] ?? {}
+                  const hasAny = v.pn?.trim() || v.name?.trim() || v.note?.trim() || v.qty?.trim() || v.mass?.trim()
+                  return (
+                    <div key={item.id} className={`rev-dlg__item-card${hasAny ? ' rev-dlg__item-card--active' : ''}`}>
+                      <div className="rev-dlg__item-current">
+                        <span className="rev-dlg__lv">Lv{item.level}</span>
+                        <span className="rev-dlg__cur-pn">{item.tg_part_no}</span>
+                        <span className="rev-dlg__name">{item.part_name}</span>
+                      </div>
+                      <div className="rev-dlg__item-inputs">
+                        <div className="rev-dlg__input-row">
+                          <div className="rev-dlg__input-field rev-dlg__input-field--pn">
+                            <label>Part No. ใหม่</label>
+                            <input className="rev-dlg__inp rev-dlg__inp--mono"
+                              placeholder="เว้นว่างถ้าไม่เปลี่ยน"
+                              value={v.pn ?? ''}
+                              onChange={e => onItemChange(item.id, 'pn', e.target.value)}
+                            />
+                          </div>
+                          <div className="rev-dlg__input-field">
+                            <label>Part Name ใหม่</label>
+                            <input className="rev-dlg__inp"
+                              placeholder="เว้นว่างถ้าไม่เปลี่ยน"
+                              value={v.name ?? ''}
+                              onChange={e => onItemChange(item.id, 'name', e.target.value)}
+                            />
+                          </div>
+                        </div>
+                        <div className="rev-dlg__input-row">
+                          <div className="rev-dlg__input-field rev-dlg__input-field--spec">
+                            <label>Material Spec ใหม่</label>
+                            <input className="rev-dlg__inp"
+                              placeholder="เว้นว่างถ้าไม่เปลี่ยน"
+                              value={v.note ?? ''}
+                              onChange={e => onItemChange(item.id, 'note', e.target.value)}
+                            />
+                          </div>
+                          <div className="rev-dlg__input-field rev-dlg__input-field--sm">
+                            <label>Q'ty</label>
+                            <input className="rev-dlg__inp"
+                              placeholder="—"
+                              value={v.qty ?? ''}
+                              onChange={e => onItemChange(item.id, 'qty', e.target.value)}
+                            />
+                          </div>
+                          <div className="rev-dlg__input-field rev-dlg__input-field--sm">
+                            <label>Weight (g)</label>
+                            <input className="rev-dlg__inp"
+                              placeholder="—"
+                              value={v.mass ?? ''}
+                              onChange={e => onItemChange(item.id, 'mass', e.target.value)}
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )
+                })}
               </div>
 
               {error && <div className="rev-dlg__error">⚠ {error}</div>}

@@ -1,10 +1,19 @@
 import express from 'express'
 import multer from 'multer'
 import path from 'path'
+import fs from 'fs'
 import { fileURLToPath } from 'url'
 import { pool } from '../db.js'
 
 const router = express.Router()
+
+function deleteImageFile(imageUrl) {
+  if (!imageUrl) return
+  try {
+    const filePath = path.join(__dirname, '../../', imageUrl)
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath)
+  } catch { /* ignore missing files */ }
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const upload = multer({
@@ -60,7 +69,9 @@ const ITEMS_SQL = `
   WITH it AS (
     SELECT b.bom_id, b.variant_id, b.parent_part_id, b.child_part_id,
            b.bom_level, b.level_code, b.quantity, b.sort_order, b.notes AS bom_notes,
-           b.update_level, b.status
+           b.update_level, b.status,
+           b.price_per_pc, b.supplier, b.lead_time_day, b.completion_remark,
+           b.snapshot_part_name, b.snapshot_mass_gram, b.snapshot_image_url
     FROM tg.bom b
     WHERE b.design_spec_id = $1
       AND (b.status IS NULL OR b.status <> 'obsolete')
@@ -76,8 +87,8 @@ const ITEMS_SQL = `
     p.tg_part_no,
     p.customer_part_no,
     p.soc_flag                                                 AS soc,
-    p.mass_gram                                                AS mass_g,
-    p.part_name,
+    COALESCE(it.snapshot_mass_gram, p.mass_gram)               AS mass_g,
+    COALESCE(it.snapshot_part_name, p.part_name)               AS part_name,
     p.product_standard                                         AS product_standards,
     p.material_standard                                        AS material_standards,
     CASE WHEN p.is_purchased_material THEN '#' ELSE NULL END   AS use_portion,
@@ -93,7 +104,11 @@ const ITEMS_SQL = `
     it.sort_order,
     it.update_level,
     it.status,
-    p.image_url
+    it.snapshot_image_url                                        AS image_url,
+    it.price_per_pc,
+    it.supplier          AS completion_supplier,
+    it.lead_time_day,
+    it.completion_remark
   FROM it
   JOIN tg.part p ON it.child_part_id = p.part_id
   LEFT JOIN LATERAL (
@@ -220,26 +235,26 @@ router.get('/:id', async (req, res) => {
       levRes.rows.forEach(r => { itemUpdateLevels[r.bom_id] = r.update_level })
     } catch (_) {}
 
-    // TGT Part No. history (migration_002)
-    let tgtHistory = []
-    let tgtUpdateLevel = 0
-    try {
-      const [tgtHRes, tgtLRes] = await Promise.all([
-        pool.query(
-          `SELECT introduced_at, superseded_at, old_tg_part_no
-           FROM tg.design_spec_tgt_history
-           WHERE design_spec_id = $1
-           ORDER BY superseded_at`,
-          [req.params.id]
-        ),
-        pool.query(
-          'SELECT tgt_update_level FROM tg.design_spec WHERE design_spec_id = $1',
-          [req.params.id]
-        ),
-      ])
-      tgtHistory = tgtHRes.rows
-      tgtUpdateLevel = tgtLRes.rows[0]?.tgt_update_level ?? 0
-    } catch (_) {}
+      // TGT Part No. history (migration_002)
+      let tgtHistory = []
+      let tgtUpdateLevel = 0
+      try {
+        const [tgtHRes, tgtLRes] = await Promise.all([
+          pool.query(
+            `SELECT introduced_at, superseded_at, old_tg_part_no
+             FROM tg.design_spec_tgt_history
+             WHERE design_spec_id = $1
+             ORDER BY superseded_at`,
+            [req.params.id]
+          ),
+          pool.query(
+            'SELECT tgt_update_level FROM tg.design_spec WHERE design_spec_id = $1',
+            [req.params.id]
+          ),
+        ])
+        tgtHistory = tgtHRes.rows
+        tgtUpdateLevel = tgtLRes.rows[0]?.tgt_update_level ?? 0
+      } catch (_) {}
 
     const enrichedItems = items.map(item => ({
       ...item,
@@ -260,37 +275,116 @@ router.get('/:id', async (req, res) => {
 })
 
 // POST /api/bom/:id/revision
-// Record a BOM update: save old part nos to history, update to new, add bom_revision row
+// Record a BOM update: save old part nos to history, update to new, add bom_revision row.
+// Items with new_part_no → full revision flow (revised_out + new row).
+// Items without new_part_no but with other changed fields → direct UPDATE, no revision mark.
 router.post('/:id/revision', async (req, res) => {
   const dsId = parseInt(req.params.id)
   const { eci_no, revision_date, revisioner, approved_by, items = [], new_tg_part_no } = req.body
+
+  let pnChangeItems    = items.filter(i => i.new_part_no?.trim())
+  const metaOnlyItems  = items.filter(i => !i.new_part_no?.trim() &&
+    (i.new_part_name?.trim() || i.new_note?.trim() || i.new_quantity?.trim() || i.new_mass?.trim()))
 
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
 
-    // Determine next update level from existing bom_revision marks
-    const { rows: lvRows } = await client.query(
-      `SELECT COALESCE(
-         MAX(CASE WHEN mark ~ '^[0-9]+$' THEN mark::smallint ELSE 0 END), 0
-       ) AS max_level
-       FROM tg.bom_revision WHERE design_spec_id = $1`,
-      [dsId]
-    )
-    const maxLevel = lvRows[0].max_level ?? 0
-    // First issue counts as "1", so first real update = △2
-    const newLevel = maxLevel === 0 ? 2 : maxLevel + 1
+    // ── Metadata-only items: direct UPDATE to part + bom, no revision mark ──
+    for (const { bom_id, new_part_name, new_note, new_quantity, new_mass } of metaOnlyItems) {
+      const { rows: cur } = await client.query(
+        `SELECT b.notes AS bom_notes, b.quantity, b.child_part_id
+         FROM tg.bom b WHERE b.bom_id=$1 AND b.design_spec_id=$2`,
+        [bom_id, dsId]
+      )
+      if (!cur.length) continue
+      const c = cur[0]
 
-    // Process each changed item
-    for (const { bom_id, new_part_no } of items) {
+      // Extract existing sub-values from bom.notes
+      const existBom   = c.bom_notes ?? ''
+      const existQtyT  = existBom.match(/Q'ty:\s*([^|]+)/)?.[1]?.trim()   ?? null
+      const existMassT = existBom.match(/Weight:\s*([^|]+)/)?.[1]?.trim() ?? null
+      const existSpec  = existBom
+        .replace(/Q'ty:\s*[^|]+\|?\s*/g, '')
+        .replace(/Weight:\s*[^|]+\|?\s*/g, '')
+        .trim().replace(/\|\s*$/, '').trim() || null
+
+      // New value if provided, else keep existing
+      const finalSpec  = new_note?.trim()     || existSpec
+      const finalQtyT  = new_quantity?.trim() || existQtyT
+      const finalMassT = new_mass?.trim()     || existMassT
+
+      const qtyNum  = finalQtyT  ? Number(finalQtyT)  : null
+      const massNum = finalMassT ? Number(finalMassT) : null
+      const qtyVal  = qtyNum  !== null && !isNaN(qtyNum)  ? qtyNum  : null
+      const massVal = massNum !== null && !isNaN(massNum) ? massNum : null
+
+      const bomNoteParts = [
+        finalSpec || null,
+        qtyVal  === null && finalQtyT  ? `Q'ty: ${finalQtyT}`    : null,
+        massVal === null && finalMassT ? `Weight: ${finalMassT}` : null,
+      ].filter(Boolean)
+      const newBomNotes = bomNoteParts.length ? bomNoteParts.join(' | ') : null
+
+      // Update only tg.bom for this specific row — never touch tg.part (shared across rows)
+      const finalBomNotes = newBomNotes ?? c.bom_notes ?? null
+      const newSnapName = new_part_name?.trim() || null
+      const newSnapMass = massVal !== null ? massVal : null
+      await client.query(
+        `UPDATE tg.bom
+           SET quantity           = $1,
+               notes              = $2,
+               snapshot_part_name = COALESCE($3, snapshot_part_name),
+               snapshot_mass_gram = COALESCE($4, snapshot_mass_gram)
+         WHERE bom_id = $5`,
+        [qtyVal !== null ? qtyVal : c.quantity, finalBomNotes, newSnapName, newSnapMass, bom_id]
+      )
+    }
+
+    // When TGT Part No. changes, auto-include the active Level 1 BOM item so it gets
+    // revised_out and a new row with the new TGT part no. is inserted automatically.
+    if (new_tg_part_no?.trim()) {
+      const { rows: lv1Rows } = await client.query(
+        `SELECT bom_id FROM tg.bom
+         WHERE design_spec_id = $1 AND bom_level = 1 AND (status IS NULL OR status = 'active')
+         ORDER BY sort_order LIMIT 1`,
+        [dsId]
+      )
+      if (lv1Rows.length && !pnChangeItems.some(i => i.bom_id === lv1Rows[0].bom_id)) {
+        pnChangeItems = [
+          ...pnChangeItems,
+          { bom_id: lv1Rows[0].bom_id, new_part_no: new_tg_part_no.trim(),
+            new_part_name: null, new_note: null, new_quantity: null, new_mass: null }
+        ]
+      }
+    }
+
+    // ── Determine revision level (needed only when there are Part No. changes or TGT change) ──
+    let newLevel = null
+    if (pnChangeItems.length > 0 || new_tg_part_no?.trim()) {
+      const { rows: lvRows } = await client.query(
+        `SELECT COALESCE(
+           MAX(CASE WHEN mark ~ '^[0-9]+$' THEN mark::smallint ELSE 0 END), 0
+         ) AS max_level
+         FROM tg.bom_revision WHERE design_spec_id = $1`,
+        [dsId]
+      )
+      const maxLevel = lvRows[0].max_level ?? 0
+      newLevel = maxLevel === 0 ? 2 : maxLevel + 1
+    }
+
+    // ── Part No. change items: full revision flow ──
+    for (const { bom_id, new_part_no, new_part_name, new_note, new_quantity, new_mass } of pnChangeItems) {
       if (!new_part_no?.trim()) continue
 
-      // ดึงข้อมูล bom row เดิม + part เดิม
       const { rows: cur } = await client.query(
         `SELECT b.update_level, b.sort_order, b.variant_id, b.parent_part_id,
-                b.bom_level, b.level_code, b.quantity,
+                b.bom_level, b.level_code, b.quantity, b.notes AS bom_notes,
                 p.tg_part_no, p.customer_part_no, p.part_id,
-                p.part_name, p.mass_gram, p.product_standard, p.material_standard,
+                COALESCE(b.snapshot_part_name, p.part_name) AS part_name,
+                COALESCE(b.snapshot_mass_gram, p.mass_gram) AS mass_gram,
+                COALESCE(b.snapshot_image_url, p.image_url) AS display_image_url,
+                p.product_standard, p.material_standard,
                 p.is_purchased_material, p.reg_certif_required, p.notes
          FROM tg.bom b JOIN tg.part p ON p.part_id = b.child_part_id
          WHERE b.bom_id = $1 AND b.design_spec_id = $2`,
@@ -299,7 +393,6 @@ router.post('/:id/revision', async (req, res) => {
       if (!cur.length) continue
       const c = cur[0]
 
-      // บันทึก history
       await client.query(
         `INSERT INTO tg.bom_item_history
            (bom_id, introduced_at, superseded_at, old_tg_part_no, old_customer_part_no)
@@ -307,16 +400,42 @@ router.post('/:id/revision', async (req, res) => {
         [bom_id, c.update_level, newLevel, c.tg_part_no, c.customer_part_no]
       )
 
-      // นับ update_level เฉพาะ part นี้ (ไม่ใช่ global)
       const partUpdateLevel = (parseInt(c.update_level) || 0) + 1
-
-      // mark row เดิมเป็น revised_out (แสดงขีดฆ่า ไม่ลบ)
       await client.query(
-        `UPDATE tg.bom SET status='revised_out', update_level=$1 WHERE bom_id=$2`,
-        [partUpdateLevel, bom_id]
+        `UPDATE tg.bom SET status='revised_out', update_level=$1,
+           snapshot_part_name=$2, snapshot_mass_gram=$3, snapshot_image_url=$4
+         WHERE bom_id=$5`,
+        [partUpdateLevel, c.part_name, c.mass_gram, c.display_image_url ?? null, bom_id]
       )
 
-      // หา part ใหม่หรือสร้างใหม่
+      // Extract old Q'ty/Weight/Spec from old bom.notes as fallbacks
+      const oldBomNotes = c.bom_notes ?? ''
+      const oldQtyT  = oldBomNotes.match(/Q'ty:\s*([^|]+)/)?.[1]?.trim()   ?? null
+      const oldMassT = oldBomNotes.match(/Weight:\s*([^|]+)/)?.[1]?.trim() ?? null
+      const oldSpec  = oldBomNotes
+        .replace(/Q'ty:\s*[^|]+\|?\s*/g, '')
+        .replace(/Weight:\s*[^|]+\|?\s*/g, '')
+        .trim().replace(/\|\s*$/, '').trim() || null
+
+      // New value if provided, else inherit from old row
+      const finalSpec  = new_note?.trim()     || oldSpec
+      const finalQtyT  = new_quantity?.trim() || oldQtyT
+      const finalMassT = new_mass?.trim()     || oldMassT
+
+      const qtyNum  = finalQtyT  ? Number(finalQtyT)  : null
+      const massNum = finalMassT ? Number(finalMassT) : null
+      const newQtyVal  = qtyNum  !== null && !isNaN(qtyNum)  ? qtyNum  : null
+      const newMassVal = massNum !== null && !isNaN(massNum) ? massNum : null
+
+      // bom.notes for new row (Material Spec + Q'ty/Weight text)
+      const newPartNotes = finalSpec || null
+      const bomNoteParts = [
+        finalSpec || null,
+        newQtyVal  === null && finalQtyT  ? `Q'ty: ${finalQtyT}`    : null,
+        newMassVal === null && finalMassT ? `Weight: ${finalMassT}` : null,
+      ].filter(Boolean)
+      const newBomNotes = bomNoteParts.length ? bomNoteParts.join(' | ') : null
+
       const newPn = new_part_no.trim()
       let newPartId
       const { rows: existPart } = await client.query(
@@ -324,6 +443,8 @@ router.post('/:id/revision', async (req, res) => {
       )
       if (existPart.length) {
         newPartId = existPart[0].part_id
+        // Never update tg.part — it is shared. User-supplied values go into snapshot
+        // columns on the new BOM row only.
       } else {
         const r = await client.query(
           `INSERT INTO tg.part
@@ -331,45 +452,60 @@ router.post('/:id/revision', async (req, res) => {
               product_standard, material_standard, notes,
               is_purchased_material, reg_certif_required)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING part_id`,
-          [newPn, c.customer_part_no, c.part_name, c.mass_gram,
-           c.product_standard, c.material_standard, c.notes,
+          [newPn, c.customer_part_no,
+           new_part_name?.trim() || c.part_name,
+           newMassVal !== null ? newMassVal : c.mass_gram,
+           c.product_standard, c.material_standard,
+           newPartNotes !== null ? newPartNotes : c.notes,
            c.is_purchased_material, c.reg_certif_required]
         )
         newPartId = r.rows[0].part_id
       }
 
-      // เลื่อน sort_order ของแถวที่อยู่ถัดจาก row เดิมออกก่อน (+1)
       await client.query(
         `UPDATE tg.bom SET sort_order = sort_order + 1
          WHERE design_spec_id = $1 AND sort_order > $2`,
         [dsId, c.sort_order]
       )
 
-      // INSERT row ใหม่ต่อจาก row เดิมทันที
+      // Lock tg.part values as snapshots for the new revision row
+      const { rows: newPRow } = await client.query(
+        'SELECT part_name, mass_gram, image_url FROM tg.part WHERE part_id = $1', [newPartId]
+      )
+      const newPCur      = newPRow[0] ?? {}
+      const revSnapName  = new_part_name?.trim() || newPCur.part_name  || null
+      const revSnapMass  = newMassVal !== null    ? newMassVal          : (newPCur.mass_gram ?? null)
+      const revSnapImage = null
+
       await client.query(
         `INSERT INTO tg.bom
            (design_spec_id, variant_id, parent_part_id, child_part_id,
-            bom_level, level_code, quantity, sort_order, status, update_level)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9)`,
+            bom_level, level_code, quantity, sort_order, status, update_level, notes,
+            snapshot_part_name, snapshot_mass_gram, snapshot_image_url)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9,$10,$11,$12,$13)`,
         [dsId, c.variant_id, c.parent_part_id, newPartId,
-         c.bom_level, c.level_code, c.quantity,
+         c.bom_level, c.level_code,
+         newQtyVal !== null ? newQtyVal : c.quantity,
          parseInt(c.sort_order) + 1,
-         partUpdateLevel]
+         partUpdateLevel,
+         newBomNotes,
+         revSnapName, revSnapMass, revSnapImage]
       )
     }
 
-    // Handle TGT Part No. change
+    // ── TGT Part No. change ──
     if (new_tg_part_no?.trim()) {
       const { rows: dsRows } = await client.query(
         'SELECT tg_part_no, tgt_update_level FROM tg.design_spec WHERE design_spec_id = $1',
         [dsId]
       )
       if (dsRows.length && dsRows[0].tg_part_no !== new_tg_part_no.trim()) {
+        let oldTgPartNo = dsRows[0].tg_part_no
         await client.query(
           `INSERT INTO tg.design_spec_tgt_history
              (design_spec_id, introduced_at, superseded_at, old_tg_part_no)
            VALUES ($1, $2, $3, $4)`,
-          [dsId, dsRows[0].tgt_update_level ?? 0, newLevel, dsRows[0].tg_part_no]
+          [dsId, dsRows[0].tgt_update_level ?? 0, newLevel, oldTgPartNo]
         )
         await client.query(
           'UPDATE tg.design_spec SET tg_part_no = $1, tgt_update_level = $2 WHERE design_spec_id = $3',
@@ -378,17 +514,19 @@ router.post('/:id/revision', async (req, res) => {
       }
     }
 
-    // Add bom_revision entry
-    await client.query(
-      `INSERT INTO tg.bom_revision
-         (design_spec_id, sort_order, mark, revision_record, eci_no, revision_date, revisioner, approved_by)
-       VALUES ($1, $2, $3, 'Update ECI No.', $4, $5, $6, $7)`,
-      [dsId, newLevel, String(newLevel),
-       eci_no ?? null,
-       revision_date ? new Date(revision_date) : null,
-       revisioner ?? null,
-       approved_by ?? null]
-    )
+    // ── Revision record (only when Part No. or TGT changed) ──
+    if (newLevel !== null) {
+      await client.query(
+        `INSERT INTO tg.bom_revision
+           (design_spec_id, sort_order, mark, revision_record, eci_no, revision_date, revisioner, approved_by)
+         VALUES ($1, $2, $3, 'Update ECI No.', $4, $5, $6, $7)`,
+        [dsId, newLevel, String(newLevel),
+         eci_no ?? null,
+         revision_date ? new Date(revision_date) : null,
+         revisioner ?? null,
+         approved_by ?? null]
+      )
+    }
 
     await client.query('COMMIT')
     res.json({ update_level: newLevel })
@@ -463,14 +601,14 @@ router.post('/:id/items/insert-after', upload.single('image'), async (req, res) 
   if (!part_name) return res.status(400).json({ error: 'part_name required' })
 
   // Accept free-form text; store non-numeric values in notes rather than crashing
-  const qtyNum = parseFloat(quantity)
-  const massNum = parseFloat(mass_gram)
-  const qtyVal = isNaN(qtyNum) ? null : qtyNum
-  const massVal = isNaN(massNum) ? null : massNum
+  const qtyNum = Number(quantity?.trim())
+  const massNum = Number(mass_gram?.trim())
+  const qtyVal = quantity?.trim() && !isNaN(qtyNum) ? qtyNum : null
+  const massVal = mass_gram?.trim() && !isNaN(massNum) ? massNum : null
   const extraParts = [
     notes || null,
-    (!isNaN(qtyNum) || !quantity) ? null : `Q'ty: ${quantity}`,
-    (!isNaN(massNum) || !mass_gram) ? null : `Weight: ${mass_gram}`,
+    qtyVal === null && quantity?.trim() ? `Q'ty: ${quantity.trim()}` : null,
+    massVal === null && mass_gram?.trim() ? `Weight: ${mass_gram.trim()}` : null,
   ].filter(Boolean)
   const combinedNotes = extraParts.length ? extraParts.join(' | ') : null
 
@@ -504,20 +642,31 @@ router.post('/:id/items/insert-after', upload.single('image'), async (req, res) 
       [dsId, newSortOrder]
     )
 
-    // Insert part
+    // Insert part — store only Material Spec in part.notes (no Q'ty/Weight text)
+    // Q'ty/Weight text goes into bom.notes so COALESCE(bom_notes, p.notes) picks it up correctly
+    const partNotes = notes?.trim() || null
+
     let partId
+    // When existing Part No. is reused, store user-entered values as row-level
+    // overrides (snapshot columns) so this BOM row shows correct values via
+    // COALESCE(snapshot, tg.part) without touching the shared tg.part record.
+    let rowSnapName  = null
+    let rowSnapMass  = null
+    let rowSnapImage = imageUrl  // only the explicitly uploaded image; null if none
+
     if (tg_part_no) {
       const { rows: ex } = await client.query(
         'SELECT part_id FROM tg.part WHERE tg_part_no = $1', [tg_part_no]
       )
       if (ex.length) {
         partId = ex[0].part_id
-        if (imageUrl) await client.query('UPDATE tg.part SET image_url=$1 WHERE part_id=$2', [imageUrl, partId])
+        rowSnapName  = part_name?.trim() || null
+        rowSnapMass  = massVal !== null ? massVal : null
       } else {
         const { rows } = await client.query(
           `INSERT INTO tg.part (tg_part_no, part_name, mass_gram, notes, image_url)
            VALUES ($1,$2,$3,$4,$5) RETURNING part_id`,
-          [tg_part_no, part_name, massVal, combinedNotes, imageUrl]
+          [tg_part_no, part_name, massVal, partNotes, imageUrl]
         )
         partId = rows[0].part_id
       }
@@ -525,19 +674,36 @@ router.post('/:id/items/insert-after', upload.single('image'), async (req, res) 
       const { rows } = await client.query(
         `INSERT INTO tg.part (part_name, mass_gram, notes, image_url)
          VALUES ($1,$2,$3,$4) RETURNING part_id`,
-        [part_name, massVal, combinedNotes, imageUrl]
+        [part_name, massVal, partNotes, imageUrl]
       )
       partId = rows[0].part_id
     }
 
-    // Insert BOM row
+    // Insert BOM row — store combinedNotes (Material Spec + Q'ty text + Weight text) in bom.notes.
+    // snapshot_part_name / snapshot_mass_gram are only set when reusing an existing part so that
+    // COALESCE(snapshot, tg.part) returns the user's values for this row without affecting others.
     const { rows: bomRow } = await client.query(
       `INSERT INTO tg.bom
          (design_spec_id, variant_id, parent_part_id, child_part_id,
-          bom_level, quantity, sort_order, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,'active') RETURNING bom_id`,
-      [dsId, sel.variant_id, newParentPartId, partId, newLevel, qtyVal ?? 1, newSortOrder]
+          bom_level, quantity, sort_order, status, notes,
+          snapshot_part_name, snapshot_mass_gram, snapshot_image_url)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'active',$8,$9,$10,$11) RETURNING bom_id`,
+      [dsId, sel.variant_id, newParentPartId, partId, newLevel, qtyVal ?? 1, newSortOrder, combinedNotes,
+       rowSnapName, rowSnapMass, rowSnapImage]
     )
+
+    // Record history snapshot when a new part is added with an image
+    if (rowSnapImage) {
+      await client.query(
+        `INSERT INTO tg.bom_image_history
+           (bom_id, image_url, event_type, tg_part_no, part_name, quantity, mass_gram, spec)
+         VALUES ($1,$2,'added',$3,$4,$5,$6,$7)`,
+        [bomRow[0].bom_id, rowSnapImage,
+         tg_part_no || null, part_name || null,
+         qtyVal ?? null, massVal ?? null,
+         notes || null]
+      )
+    }
 
     await client.query('COMMIT')
     res.status(201).json({ bom_id: bomRow[0].bom_id, part_id: partId })
@@ -550,26 +716,101 @@ router.post('/:id/items/insert-after', upload.single('image'), async (req, res) 
 })
 
 // PUT /api/bom/:id/items/:itemId
-router.put('/:id/items/:itemId', async (req, res) => {
+router.put('/:id/items/:itemId', upload.single('image'), async (req, res) => {
   const b = req.body
+  const imageUrl = req.file ? `/uploads/parts/${req.file.filename}` : null
   try {
     const { rows: bom } = await pool.query(
-      'SELECT bom_id, child_part_id FROM tg.bom WHERE bom_id=$1 AND design_spec_id=$2',
+      'SELECT bom_id FROM tg.bom WHERE bom_id=$1 AND design_spec_id=$2',
       [req.params.itemId, req.params.id]
     )
     if (!bom.length) return res.status(404).json({ error: 'Item not found' })
 
-    await pool.query(
-      'UPDATE tg.bom SET quantity=$1, level_code=$2, sort_order=$3, notes=$4 WHERE bom_id=$5',
-      [b.quantity ?? 1, b.level_code ?? null, b.sort_order ?? 0, b.note ?? null, req.params.itemId]
-    )
-    if (b.part_name) {
-      await pool.query(
-        'UPDATE tg.part SET part_name=$1, mass_gram=$2, notes=$3, updated_at=NOW() WHERE part_id=$4',
-        [b.part_name, b.mass_g ?? null, b.note ?? null, bom[0].child_part_id]
+    const newSnapName = b.part_name?.trim() || null
+    const massNum     = b.mass_g != null ? Number(b.mass_g) : null
+    const newSnapMass = massNum !== null && !isNaN(massNum) ? massNum : null
+
+    // If a new image is being uploaded, archive the current state first
+    if (imageUrl) {
+      const { rows: cur } = await pool.query(
+        `SELECT b.snapshot_image_url,
+                COALESCE(b.snapshot_part_name, p.part_name) AS part_name,
+                p.tg_part_no, b.quantity,
+                COALESCE(b.snapshot_mass_gram, p.mass_gram) AS mass_gram,
+                COALESCE(b.bom_notes, p.notes)              AS spec
+         FROM tg.bom b JOIN tg.part p ON p.part_id = b.child_part_id
+         WHERE b.bom_id = $1`, [req.params.itemId]
       )
+      const oldImg = cur[0]?.snapshot_image_url
+      if (oldImg) {
+        await pool.query(
+          `INSERT INTO tg.bom_image_history
+             (bom_id, image_url, event_type, tg_part_no, part_name, quantity, mass_gram, spec)
+           VALUES ($1,$2,'image_replaced',$3,$4,$5,$6,$7)`,
+          [req.params.itemId, oldImg,
+           cur[0].tg_part_no, cur[0].part_name,
+           cur[0].quantity, cur[0].mass_gram, cur[0].spec]
+        )
+      }
     }
+
+    await pool.query(
+      `UPDATE tg.bom SET
+         quantity           = COALESCE($1,  quantity),
+         level_code         = COALESCE($2,  level_code),
+         sort_order         = COALESCE($3,  sort_order),
+         notes              = COALESCE($4,  notes),
+         price_per_pc       = $5,
+         supplier           = $6,
+         lead_time_day      = $7,
+         completion_remark  = $8,
+         snapshot_part_name = COALESCE($9,  snapshot_part_name),
+         snapshot_mass_gram = COALESCE($10, snapshot_mass_gram),
+         snapshot_image_url = COALESCE($11, snapshot_image_url)
+       WHERE bom_id = $12`,
+      [b.quantity   != null ? b.quantity   : null,
+       b.level_code != null ? b.level_code : null,
+       b.sort_order != null ? b.sort_order : null,
+       b.note       != null ? b.note       : null,
+       b.price    ? parseFloat(b.price)  : null,
+       (b.supplier && b.supplier !== '–') ? b.supplier : null,
+       b.lead_time ? parseInt(b.lead_time) : null,
+       b.remark || null,
+       newSnapName,
+       newSnapMass,
+       imageUrl,
+       req.params.itemId]
+    )
     res.json({ updated: true })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// GET /api/bom/:id/image-history
+router.get('/:id/image-history', async (req, res) => {
+  const dsId = parseInt(req.params.id)
+  try {
+    const { rows } = await pool.query(`
+      SELECT
+        h.id,
+        h.bom_id,
+        h.image_url,
+        h.event_type,
+        COALESCE(h.tg_part_no,  p.tg_part_no)                    AS tg_part_no,
+        COALESCE(h.part_name,   b.snapshot_part_name, p.part_name) AS part_name,
+        COALESCE(h.quantity,    b.quantity)                        AS quantity,
+        COALESCE(h.mass_gram,   b.snapshot_mass_gram, p.mass_gram) AS mass_gram,
+        h.spec,
+        b.bom_level                                               AS level,
+        to_char(h.replaced_at AT TIME ZONE 'Asia/Bangkok', 'DD Mon YYYY HH24:MI') AS recorded_at
+      FROM tg.bom_image_history h
+      JOIN tg.bom  b ON b.bom_id  = h.bom_id
+      JOIN tg.part p ON p.part_id = b.child_part_id
+      WHERE b.design_spec_id = $1
+      ORDER BY h.replaced_at DESC
+    `, [dsId])
+    res.json(rows)
   } catch (e) {
     res.status(500).json({ error: e.message })
   }
@@ -578,11 +819,21 @@ router.put('/:id/items/:itemId', async (req, res) => {
 // DELETE /api/bom/:id/items/:itemId
 router.delete('/:id/items/:itemId', async (req, res) => {
   try {
+    // Collect all image files to delete (current snapshot + history)
+    const { rows: imgs } = await pool.query(
+      `SELECT snapshot_image_url AS url FROM tg.bom WHERE bom_id=$1
+       UNION ALL
+       SELECT image_url FROM tg.bom_image_history WHERE bom_id=$1`,
+      [req.params.itemId]
+    )
+
     const { rows } = await pool.query(
       'DELETE FROM tg.bom WHERE bom_id=$1 AND design_spec_id=$2 RETURNING bom_id',
       [req.params.itemId, req.params.id]
     )
     if (!rows.length) return res.status(404).json({ error: 'Item not found' })
+
+    imgs.forEach(r => deleteImageFile(r.url))
     res.json({ deleted: true })
   } catch (e) {
     res.status(500).json({ error: e.message })
@@ -598,8 +849,16 @@ router.delete('/:id', async (req, res) => {
     const { rows: boms } = await client.query('SELECT bom_id FROM tg.bom WHERE design_spec_id=$1', [dsId])
     const bomIds = boms.map(r => r.bom_id)
     if (bomIds.length) {
+      // Collect all image files before deleting records
+      const { rows: imgs } = await client.query(
+        `SELECT snapshot_image_url AS url FROM tg.bom WHERE bom_id = ANY($1)
+         UNION ALL
+         SELECT image_url FROM tg.bom_image_history WHERE bom_id = ANY($1)`,
+        [bomIds]
+      )
       await client.query('DELETE FROM tg.approval_tokens WHERE bom_id = ANY($1)', [bomIds])
       await client.query('DELETE FROM tg.bom_item_history WHERE bom_id = ANY($1)', [bomIds])
+      imgs.forEach(r => deleteImageFile(r.url))
     }
     await client.query('DELETE FROM tg.bom_revision WHERE design_spec_id=$1', [dsId])
     await client.query('DELETE FROM tg.design_spec_tgt_history WHERE design_spec_id=$1', [dsId])
@@ -644,6 +903,53 @@ router.delete('/:id/revisions/reset', async (req, res) => {
 
     await client.query('COMMIT')
     res.json({ reset: true })
+  } catch (e) {
+    await client.query('ROLLBACK')
+    res.status(500).json({ error: e.message })
+  } finally {
+    client.release()
+  }
+})
+
+// POST /api/bom/fix-tgt-history — Fix old_tg_part_no in history that contains * (for legacy data)
+router.post('/fix-tgt-history', async (req, res) => {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+
+    // Find all history records with * in old_tg_part_no
+    const { rows: badRecords } = await client.query(
+      `SELECT dsth.*, ds.design_spec_id
+       FROM tg.design_spec_tgt_history dsth
+       JOIN tg.design_spec ds ON ds.design_spec_id = dsth.design_spec_id
+       WHERE dsth.old_tg_part_no LIKE '%*%'`
+    )
+
+    let fixed = 0
+    for (const record of badRecords) {
+      // Get Level 1 BOM part from this design_spec
+      const { rows: lv1Items } = await client.query(
+        `SELECT DISTINCT p.tg_part_no
+         FROM tg.bom b
+         JOIN tg.part p ON p.part_id = b.child_part_id
+         WHERE b.design_spec_id = $1 AND b.bom_level = 1 AND (b.status IS NULL OR b.status = 'active')
+         LIMIT 1`,
+        [record.design_spec_id]
+      )
+
+      if (lv1Items.length && lv1Items[0].tg_part_no && !lv1Items[0].tg_part_no.includes('*')) {
+        await client.query(
+          `UPDATE tg.design_spec_tgt_history
+           SET old_tg_part_no = $1
+           WHERE design_spec_id = $2 AND introduced_at = $3`,
+          [lv1Items[0].tg_part_no, record.design_spec_id, record.introduced_at]
+        )
+        fixed++
+      }
+    }
+
+    await client.query('COMMIT')
+    res.json({ fixed })
   } catch (e) {
     await client.query('ROLLBACK')
     res.status(500).json({ error: e.message })

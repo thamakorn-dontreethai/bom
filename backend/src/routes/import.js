@@ -607,6 +607,15 @@ router.post('/pdf', upload.single('file'), async (req, res) => {
       return res.status(422).json({ error: 'ไม่พบข้อมูล BOM ใน PDF นี้' })
     }
 
+    // ── Fix: Use Level 1 BOM item TG Part No. if header has incomplete data (e.g. "78500-DA000-6***") ──
+    let correctedTgPartNo = header.tg_part_no
+    if (correctedTgPartNo && correctedTgPartNo.includes('*')) {
+      const lv1Item = items.find(i => i.level === 1 && i.tg_part_no)
+      if (lv1Item?.tg_part_no) {
+        correctedTgPartNo = lv1Item.tg_part_no
+      }
+    }
+
     const client = await pool.connect()
     try {
       await client.query('BEGIN')
@@ -633,7 +642,7 @@ router.post('/pdf', upload.single('file'), async (req, res) => {
              production_level=$5, initial_stage=$6, reg_certif=$7,
              effective_date=$8, customer_standard=$9, tg_standard=$10
            WHERE design_spec_id=$11`,
-          [modelId, customerId, header.customer_part_no, header.tg_part_no,
+          [modelId, customerId, header.customer_part_no, correctedTgPartNo,
            header.production_level, header.initial_stage, header.reg_certif,
            effDate, header.customer_standards, header.tg_standards, dsId]
         )
@@ -642,7 +651,7 @@ router.post('/pdf', upload.single('file'), async (req, res) => {
       } else {
         // ── Step 2: หาจาก customer_part_no + tg_part_no suffix revision ──
         const revisionDsId = await findExistingBomByPartNo(
-          client, header.customer_part_no, header.tg_part_no
+          client, header.customer_part_no, correctedTgPartNo
         )
         if (revisionDsId) {
           dsId = revisionDsId
@@ -652,7 +661,7 @@ router.post('/pdf', upload.single('file'), async (req, res) => {
                tg_part_no=$1, internal_eci_no=$2, effective_date=$3,
                production_level=$4, initial_stage=$5
              WHERE design_spec_id=$6`,
-            [header.tg_part_no, header.internal_eci_no, effDate,
+            [correctedTgPartNo, header.internal_eci_no, effDate,
              header.production_level, header.initial_stage, dsId]
           )
         }
@@ -665,7 +674,7 @@ router.post('/pdf', upload.single('file'), async (req, res) => {
               production_level, initial_stage, reg_certif, effective_date,
               customer_standard, tg_standard)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING design_spec_id`,
-          [modelId, customerId, header.customer_part_no, header.tg_part_no,
+          [modelId, customerId, header.customer_part_no, correctedTgPartNo,
            header.internal_eci_no, header.production_level, header.initial_stage,
            header.reg_certif, effDate, header.customer_standards, header.tg_standards]
         )

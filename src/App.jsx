@@ -107,7 +107,7 @@ const NAV_TABS = [
   { id: 'document', icon: '📄', label: 'Document' },
   { id: 'tree',     icon: '🌿', label: 'BOM Tree' },
   { id: 'complete', icon: '📋', label: 'Completion' },
-  { id: 'export',   icon: '📤', label: 'Export' },
+  { id: 'export',   icon: '🖼', label: 'Photos' },
 ]
 
 export default function App() {
@@ -174,72 +174,116 @@ export default function App() {
 
   /* ── Home ─────────────────────────────────────────────────── */
   if (view === 'home') return (
-    <div className="shell">
-      <div className="shell-topbar">
+    <div className="shell"
+      onDrop={e => { e.preventDefault(); if (!uploading) handleFile(e.dataTransfer.files[0]) }}
+      onDragOver={e => e.preventDefault()}
+    >
+      <input ref={fileRef} type="file" accept=".pdf" style={{ display: 'none' }} onChange={e => handleFile(e.target.files[0])} />
+         {/*tapbar*/}
+      <div className="shell-topbar"> 
         <span className="shell-logo">BOM</span>
         <span className="shell-title">BILL OF MATERIAL · Toyoda Gosei</span>
       </div>
 
       <div className="home-wrap">
-        {/* stats */}
-        <div className="home-stats">
-          <div className="hstat"><div className="hstat-n">{bomList.length}</div><div className="hstat-l">BOM ทั้งหมด</div></div>
-          <div className="hstat"><div className="hstat-n">{bomList.filter(b => b.model === '3GJ').length}</div><div className="hstat-l">Model 3GJ</div></div>
-          <div className="hstat"><div className="hstat-n">{new Set(bomList.map(b => b.customer)).size}</div><div className="hstat-l">ลูกค้า</div></div>
-          <div className="hstat"><div className="hstat-n">{bomList.filter(b => b.type === 'HE').length}</div><div className="hstat-l">Type HE</div></div>
-        </div>
+        {/* Stats */}
+        {(() => {
+          const modelCounts = {}
+          bomList.forEach(b => { if (b.model) modelCounts[b.model] = (modelCounts[b.model] || 0) + 1 })
+          const topModel = Object.entries(modelCounts).sort((a, b) => b[1] - a[1])[0]
+          const typeCounts = {}
+          bomList.forEach(b => { if (b.type) typeCounts[b.type] = (typeCounts[b.type] || 0) + 1 })
+          const topType = Object.entries(typeCounts).sort((a, b) => b[1] - a[1])[0]
+          return (
+            <div className="home-stats">
+              <div className="hstat hstat--blue"><div className="hstat-n">{bomList.length}</div><div className="hstat-l">BOM ทั้งหมด</div></div>
+              <div className="hstat hstat--indigo"><div className="hstat-n">{topModel?.[1] ?? 0}</div><div className="hstat-l">Model {topModel?.[0] ?? '–'}</div></div>
+              <div className="hstat hstat--violet"><div className="hstat-n">{new Set(bomList.map(b => b.customer)).size}</div><div className="hstat-l">ลูกค้า</div></div>
+              <div className="hstat hstat--teal"><div className="hstat-n">{topType?.[1] ?? 0}</div><div className="hstat-l">Type {topType?.[0] ?? '–'}</div></div>
+            </div>
+          )
+        })()}
 
-        {/* upload / skeleton */}
-        {uploading ? <SkeletonBomDoc /> : (
-          <div
-            className="home-upload"
-            onClick={() => fileRef.current?.click()}
+        {uploading && <SkeletonBomDoc />}
+
+        {/* Upload zone — always visible when not uploading */}
+        {!uploading && (
+          <div className="home-dropzone" onClick={() => fileRef.current?.click()}
             onDrop={e => { e.preventDefault(); handleFile(e.dataTransfer.files[0]) }}
-            onDragOver={e => e.preventDefault()}
+            onDragOver={e => { e.preventDefault(); e.currentTarget.classList.add('home-dropzone--drag') }}
+            onDragLeave={e => e.currentTarget.classList.remove('home-dropzone--drag')}
           >
-            <input ref={fileRef} type="file" accept=".pdf" style={{ display: 'none' }} onChange={e => handleFile(e.target.files[0])} />
-            <div className="home-upload-icon">☁</div>
-            <div className="home-upload-text">อัปโหลด Design Specification PDF</div>
-            <div className="home-upload-sub">คลิกหรือลากไฟล์มาวางที่นี่</div>
+            <svg className="home-dropzone-icon" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M32 44V24M32 24L24 32M32 24L40 32" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+              <path d="M20 48H14a10 10 0 1 1 2.4-19.7A14 14 0 1 1 44 36h-2" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+              <path d="M24 48h16" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+            </svg>
+            <div className="home-dropzone-title">อัปโหลด Design Specification PDF</div>
+            <div className="home-dropzone-sub">ลากไฟล์มาวางที่นี่ หรือ <span className="home-dropzone-link">คลิกเพื่อเลือกไฟล์</span></div>
+            <div className="home-dropzone-hint">รองรับไฟล์ .pdf เท่านั้น</div>
           </div>
         )}
-        {error && <div className="home-error">⚠ {error}</div>}
-        {saveMsg && <div className="home-savemsg">✓ บันทึกแล้ว</div>}
 
-        {/* list */}
-        {!uploading && <div className="home-section-title">รายการ BOM ล่าสุด</div>}
-        {!uploading && bomList.length > 0 && (
-          <input
-            className="home-search"
-            placeholder=" ค้นหา Part No. หรือชื่อ BOM…"
-            value={homeSearch}
-            onChange={e => setHomeSearch(e.target.value)}
-          />
-        )}
-        {uploading ? null : bomList.length === 0
-          ? <div className="home-empty">ยังไม่มี BOM — อัปโหลด PDF เพื่อเริ่มต้น</div>
-          : bomList.filter(b => {
-              if (!homeSearch.trim()) return true
-              const q = homeSearch.toLowerCase()
-              return b.tg_part_no?.toLowerCase().includes(q) ||
-                     b.customer_part_no?.toLowerCase().includes(q) ||
-                     b.model?.toLowerCase().includes(q)
-            }).map(b => (
-            <div key={b.id} className="home-card" onClick={() => selectBom(b.id)}>
-              <div className="home-card-icon">📄</div>
-              <div className="home-card-body">
-                <div className="home-card-title">{b.tg_part_no ?? b.customer_part_no}</div>
-                <div className="home-card-sub">Model: {b.model} · {b.customer} · {b.date ?? '–'}</div>
+        {!uploading && <>
+          {error && <div className="home-error">⚠ {error}</div>}
+          {saveMsg && <div className="home-savemsg">✓ บันทึกแล้ว</div>}
+
+          {/* Search + count */}
+          <div className="home-list-header">
+            <span className="home-list-title">รายการ BOM</span>
+            <span className="home-list-count">{bomList.length} รายการ</span>
+          </div>
+          <div className="home-search-wrap">
+            <svg className="home-search-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+            </svg>
+            <input
+              className="home-search"
+              placeholder="ค้นหา Part No. หรือชื่อ BOM…"
+              value={homeSearch}
+              onChange={e => setHomeSearch(e.target.value)}
+            />
+            {homeSearch && <button className="home-search-clear" onClick={() => setHomeSearch('')}>✕</button>}
+          </div>
+
+          {/* BOM list */}
+          {bomList.length === 0
+            ? (
+              <div className="home-empty-state">
+                <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="1.5" style={{marginBottom:12}}>
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                  <polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/>
+                  <line x1="9" y1="15" x2="15" y2="15"/>
+                </svg>
+                <div className="home-empty-title">ยังไม่มี BOM</div>
+                <div className="home-empty-sub">คลิก Upload PDF หรือลากไฟล์มาวางที่นี่เพื่อเริ่มต้น</div>
               </div>
-              <button
-                className="home-card-del"
-                title="ลบ BOM นี้"
-                onClick={e => { e.stopPropagation(); setDeleteConfirm(b) }}
-              >🗑</button>
-              <div className="home-card-arrow">›</div>
-            </div>
-          ))
-        }
+            )
+            : bomList.filter(b => {
+                if (!homeSearch.trim()) return true
+                const q = homeSearch.toLowerCase()
+                return b.tg_part_no?.toLowerCase().includes(q) ||
+                       b.customer_part_no?.toLowerCase().includes(q) ||
+                       b.model?.toLowerCase().includes(q)
+              }).map(b => (
+              <div key={b.id} className="home-card" onClick={() => selectBom(b.id)}>
+                <div className="home-card-accent" />
+                <div className="home-card-icon">📄</div>
+                <div className="home-card-body">
+                  <div className="home-card-title">{b.tg_part_no ?? b.customer_part_no}</div>
+                  <div className="home-card-meta">
+                    <span className="home-card-tag">{b.model ?? '–'}</span>
+                    <span className="home-card-tag">{b.type ?? '–'}</span>
+                    <span>{b.customer ?? '–'}</span>
+                    <span>{b.date ?? '–'}</span>
+                  </div>
+                </div>
+                <button className="home-card-del" title="ลบ BOM นี้"
+                  onClick={e => { e.stopPropagation(); setDeleteConfirm(b) }}>🗑️</button>
+              </div>
+            ))
+          }
+        </>}
       </div>
 
       {deleteConfirm && (
@@ -263,17 +307,23 @@ export default function App() {
     </div>
   )
 
-  /* ── BOM screens ──────────────────────────────────────────── */
+  /* ── BOM screens Document View──────────────────────────────────────────── */
   return (
     <div className="shell">
       <div className="shell-topbar">
         <span className="shell-logo">BOM</span>
         <span className="shell-title">BILL OF MATERIAL · Toyoda Gosei</span>
         <span className="shell-bom-id">{bom?.tg_part_no ?? ''}</span>
-        <button className="shell-back" onClick={() => setView('home')}>← Home</button>
       </div>
 
       <div className="shell-nav">
+        <button className="shell-tab shell-tab--home" onClick={() => setView('home')} title="กลับหน้าหลัก">
+          <svg width="13" height="13" viewBox="0 0 576 512" fill="currentColor" style={{verticalAlign:'middle',marginRight:5}}>
+            <path d="M575.8 255.5c0 18-15 32.1-32 32.1h-32l.7 160.2c0 2.7-.2 5.4-.5 8.1V472c0 22.1-17.9 40-40 40H456c-1.1 0-2.2 0-3.3-.1c-1.4.1-2.8.1-4.2.1H416 392c-22.1 0-40-17.9-40-40V448 384c0-17.7-14.3-32-32-32H256c-17.7 0-32 14.3-32 32v64 24c0 22.1-17.9 40-40 40H160 128.1c-1.5 0-3-.1-4.5-.2c-1.2.1-2.4.2-3.6.2H104c-22.1 0-40-17.9-40-40V360c0-.9 0-1.9.1-2.8V287.6H32c-18 0-32-14-32-32.1c0-9 3-17 10-24L266.4 8c7-7 15-8 22-8s15 2 21 7L564.8 231.5c8 7 12 15 11 24z"/>
+          </svg>
+          Home
+        </button>
+        <div className="shell-nav-sep" />
         {NAV_TABS.map(t => (
           <button key={t.id} className={`shell-tab${view === t.id ? ' active' : ''}`} onClick={() => setView(t.id)}>
             {t.icon} {t.label}

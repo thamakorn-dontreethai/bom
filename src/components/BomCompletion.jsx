@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react'
+import { useState, useRef, useMemo } from 'react'
 
 function parseKeyList(kc) {
   if (!kc) return []
@@ -18,11 +18,38 @@ export default function BomCompletion({ bom, onRefresh }) {
   const [activeKey, setActiveKey] = useState(allKeys[0] ?? '0')
   const [rows, setRows] = useState({})
   const [saving, setSaving] = useState(false)
+
+  const dbRows = useMemo(() => {
+    const init = {}
+    ;(bom?.items ?? []).forEach(item => {
+      if (item.price_per_pc || item.completion_supplier || item.lead_time_day || item.completion_remark) {
+        init[item.id] = {
+          price: item.price_per_pc ? String(item.price_per_pc) : '',
+          supplier: item.completion_supplier ?? '–',
+          lead_time: item.lead_time_day ? String(item.lead_time_day) : '',
+          remark: item.completion_remark ?? '',
+        }
+      }
+    })
+    return init
+  }, [bom?.items])
   const [msg, setMsg] = useState(null)
   const [search, setSearch] = useState('')
 
   // Part detail popup
   const [detail, setDetail] = useState(null)
+
+  // Delete item
+  const [delConfirm, setDelConfirm] = useState(null)
+
+  async function deleteItem(item) {
+    try {
+      const r = await fetch(`/api/bom/${bom.id}/items/${item.id}`, { method: 'DELETE' })
+      if (!r.ok) throw new Error()
+      setDelConfirm(null)
+      onRefresh?.()
+    } catch { setDelConfirm(null) }
+  }
 
   // Add-part dialog
   const [addAfter, setAddAfter] = useState(null) // the item we're inserting after
@@ -41,13 +68,24 @@ export default function BomCompletion({ bom, onRefresh }) {
     return i.tg_part_no?.toLowerCase().includes(q) || i.part_name?.toLowerCase().includes(q)
   })
 
-  function getRow(id) { return rows[id] ?? { price: '', supplier: '–', lead_time: '', remark: '' } }
+  function getRow(id) { return rows[id] ?? dbRows[id] ?? { price: '', supplier: '–', lead_time: '', remark: '' } }
   function setField(id, field, val) { setRows(prev => ({ ...prev, [id]: { ...getRow(id), [field]: val } })) }
+
+  function displayQty(item) {
+    const fromNote = item.note?.match(/Q'ty:\s*([^|]+)/)?.[1]?.trim()
+    if (fromNote) return fromNote
+    return item.quantity != null ? item.quantity : '–'
+  }
+  function displayMass(item) {
+    const fromNote = item.note?.match(/Weight:\s*([^|]+)/)?.[1]?.trim()
+    if (fromNote) return fromNote
+    return item.mass_g != null ? Number(item.mass_g).toLocaleString() : '–'
+  }
 
   async function save() {
     setSaving(true); setMsg(null)
     try {
-      const updates = Object.entries(rows).filter(([, v]) => v.price || v.lead_time || v.remark)
+      const updates = Object.entries(rows).filter(([, v]) => v.price || v.lead_time || v.remark || (v.supplier && v.supplier !== '–'))
       await Promise.all(updates.map(([id, v]) =>
         fetch(`/api/bom/${bom.id}/items/${id}`, {
           method: 'PUT',
@@ -149,6 +187,7 @@ export default function BomCompletion({ bom, onRefresh }) {
               <th>Supplier</th>
               <th>Lead time (day)</th>
               <th>Remark</th>
+              <th style={{width:32}}></th>
             </tr>
           </thead>
           <tbody>
@@ -164,8 +203,8 @@ export default function BomCompletion({ bom, onRefresh }) {
                     <span className="comp-pn-link" onClick={() => setDetail(row)}>{row.tg_part_no}</span>
                   </td>
                   <td>{row.part_name}</td>
-                  <td className="comp-td-c">{row.quantity}</td>
-                  <td className="comp-td-c">{row.mass_g ? Number(row.mass_g).toLocaleString() : '–'}</td>
+                  <td className="comp-td-c">{displayQty(row)}</td>
+                  <td className="comp-td-c">{displayMass(row)}</td>
                   <td><input className="comp-input" value={r.price} onChange={e => setField(row.id, 'price', e.target.value)} placeholder="ใส่ราคา" /></td>
                   <td>
                     <select className="comp-select" value={r.supplier} onChange={e => setField(row.id, 'supplier', e.target.value)}>
@@ -174,6 +213,9 @@ export default function BomCompletion({ bom, onRefresh }) {
                   </td>
                   <td><input className="comp-input" value={r.lead_time} onChange={e => setField(row.id, 'lead_time', e.target.value)} placeholder="วัน" /></td>
                   <td><input className="comp-input" style={{ width: 120 }} value={r.remark} onChange={e => setField(row.id, 'remark', e.target.value)} placeholder="หมายเหตุ" /></td>
+                  <td className="comp-td-c">
+                    <button className="comp-del-btn" title="ลบ Part นี้" onClick={() => setDelConfirm(row)}>🗑</button>
+                  </td>
                 </tr>
               )
             })}
@@ -191,8 +233,8 @@ export default function BomCompletion({ bom, onRefresh }) {
 
       {/* ── Part Detail Popup ── */}
       {detail && (
-        <div className="comp-overlay" onClick={() => setDetail(null)}>
-          <div className="comp-dialog" onClick={e => e.stopPropagation()}>
+        <div className="comp-overlay">
+          <div className="comp-dialog">
             <div className="comp-dialog-hdr">
               <span>รายละเอียด Part</span>
               <button className="comp-dialog-close" onClick={() => setDetail(null)}>✕</button>
@@ -204,9 +246,11 @@ export default function BomCompletion({ bom, onRefresh }) {
               <div className="comp-dialog-grid">
                 <label>TG Part No.</label><span style={{fontFamily:'monospace',fontWeight:600}}>{detail.tg_part_no ?? '–'}</span>
                 <label>Part Name</label><span>{detail.part_name ?? '–'}</span>
-                <label>Material Spec</label><span style={{fontSize:12,color:'#555'}}>{detail.note ?? '–'}</span>
-                <label>Q'ty</label><span>{detail.quantity ?? '–'}</span>
-                <label>Weight (g)</label><span>{detail.mass_g ? Number(detail.mass_g).toLocaleString() : '–'}</span>
+                <label>Material Spec</label><span style={{fontSize:12,color:'#555'}}>
+                  {(detail.note ?? '').replace(/Q'ty:\s*[^|]+\|?\s*/g,'').replace(/Weight:\s*[^|]+\|?\s*/g,'').trim().replace(/\|\s*$/,'').trim() || '–'}
+                </span>
+                <label>Q'ty</label><span>{displayQty(detail)}</span>
+                <label>Weight (g)</label><span>{displayMass(detail)}</span>
                 <label>Level</label><span>Lv.{detail.level}</span>
               </div>
             </div>
@@ -219,8 +263,8 @@ export default function BomCompletion({ bom, onRefresh }) {
 
       {/* ── Add Part Dialog ── */}
       {addAfter && (
-        <div className="comp-overlay" onClick={closeAdd}>
-          <div className="comp-dialog" onClick={e => e.stopPropagation()}>
+        <div className="comp-overlay">
+          <div className="comp-dialog">
             <div className="comp-dialog-hdr">
               <span>+ เพิ่ม Part ต่อจาก <b>{addAfter.tg_part_no}</b></span>
               <button className="comp-dialog-close" onClick={closeAdd}>✕</button>
@@ -266,6 +310,26 @@ export default function BomCompletion({ bom, onRefresh }) {
               <button className="bdv-btn" onClick={submitAdd} disabled={addSaving}>
                 {addSaving ? 'กำลังบันทึก…' : '+ เพิ่ม Part'}
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Delete Confirm ── */}
+      {delConfirm && (
+        <div className="comp-overlay">
+          <div className="comp-dialog" style={{maxWidth:340}}>
+            <div className="comp-dialog-hdr">
+              <span>ยืนยันลบ Part</span>
+              <button className="comp-dialog-close" onClick={() => setDelConfirm(null)}>✕</button>
+            </div>
+            <div className="comp-dialog-body" style={{padding:'16px 20px'}}>
+              <p style={{margin:0}}>ลบ <b>{delConfirm.tg_part_no ?? delConfirm.part_name}</b> ออกจาก BOM?</p>
+              <p style={{margin:'6px 0 0',fontSize:12,color:'#888'}}>ลบได้เฉพาะ Part ที่เพิ่มเองเท่านั้น</p>
+            </div>
+            <div className="comp-dialog-footer">
+              <button className="bdv-btn bdv-btn--secondary" onClick={() => setDelConfirm(null)}>ยกเลิก</button>
+              <button className="bdv-btn bdv-btn--danger" onClick={() => deleteItem(delConfirm)}>ลบ</button>
             </div>
           </div>
         </div>
